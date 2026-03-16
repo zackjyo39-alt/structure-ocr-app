@@ -1,0 +1,16 @@
+[project]
+name = "ai-investment-analysis"
+version = "1.0.0"
+description = "A股AI投资分析系统"
+requires-python = ">=3.10"
+dependencies = [
+    "akshare>=1.16.72",
+    "pandas>=2.0.0",
+    "apscheduler>=3.10.0",
+    "tqdm>=4.60.0",
+    "sqlalchemy>=2.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
