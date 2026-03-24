@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MVP Todos</title>
+    <style>
+      body { font-family: sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+      form { display: flex; gap: .5rem; }
+      input { flex: 1; padding: .5rem; }
+      button { padding: .5rem .9rem; }
+      li { margin: .4rem 0; }
+    </style>
+  </head>
+  <body>
+    <h1>MVP Vertical Slice</h1>
+    <form id="todo-form">
+      <input id="todo-title" placeholder="Add a todo" required maxlength="120" />
+      <button type="submit">Create</button>
+    </form>
+    <ul id="todo-list"></ul>
+    <script>
+      const form = document.getElementById("todo-form");
+      const titleEl = document.getElementById("todo-title");
+      const listEl = document.getElementById("todo-list");
+
+      async function refresh() {
+        const res = await fetch("/api/v1/todos");
+        const body = await res.json();
+        listEl.innerHTML = "";
+        for (const todo of body.data) {
+          const li = document.createElement("li");
+          li.textContent = `#${todo.id} ${todo.title}`;
+          listEl.appendChild(li);
+        }
+      }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const title = titleEl.value.trim();
+        if (!title) return;
+        await fetch("/api/v1/todos", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title })
+        });
+        titleEl.value = "";
+        await refresh();
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,56 @@
+#!/usr/bin/env sh
+set -eu
+
+: "${PAPERCLIP_HOME:=/data/paperclip}"
+: "${PAPERCLIP_INSTANCE_ID:=demo}"
+: "${PAPERCLIP_CONFIG:=$PAPERCLIP_HOME/config.json}"
+: "${PAPERCLIP_DEPLOYMENT_MODE:=authenticated}"
+: "${PAPERCLIP_DEPLOYMENT_EXPOSURE:=private}"
+: "${PAPERCLIP_CANONICAL_PROJECT_ROOT:=/workspace/paperclip-demo}"
+: "${PAPERCLIP_HOST_PROJECT_ROOT:=}"
+: "${PAPERCLIP_REWRITE_FROM_ROOT:=}"
+: "${HOST:=0.0.0.0}"
+: "${PORT:=3100}"
+: "${SERVE_UI:=true}"
+: "${PAPERCLIP_OPEN_ON_LISTEN:=false}"
+: "${PAPERCLIP_ALLOWED_HOSTNAMES:=localhost,127.0.0.1}"
+: "${CODEX_HOME:=/data/codex-home}"
+
+if [ -z "${PAPERCLIP_PUBLIC_URL:-}" ]; then
+  PAPERCLIP_PUBLIC_URL="http://localhost:${PORT}"
+fi
+
+mkdir -p "$PAPERCLIP_HOME" "$CODEX_HOME" "$PAPERCLIP_CANONICAL_PROJECT_ROOT"
+
+if [ -f "$PAPERCLIP_CONFIG" ]; then
+  env \
+    PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+    PAPERCLIP_INSTANCE_ID="$PAPERCLIP_INSTANCE_ID" \
+    PAPERCLIP_CONFIG="$PAPERCLIP_CONFIG" \
+    PAPERCLIP_DEPLOYMENT_MODE="$PAPERCLIP_DEPLOYMENT_MODE" \
+    PAPERCLIP_DEPLOYMENT_EXPOSURE="$PAPERCLIP_DEPLOYMENT_EXPOSURE" \
+    PAPERCLIP_PUBLIC_URL="$PAPERCLIP_PUBLIC_URL" \
+    PAPERCLIP_ALLOWED_HOSTNAMES="$PAPERCLIP_ALLOWED_HOSTNAMES" \
+    HOST="$HOST" \
+    PORT="$PORT" \
+    SERVE_UI="$SERVE_UI" \
+    node /app/scripts/paperclip-sync-config.mjs
+
+  REWRITE_SOURCE="$PAPERCLIP_REWRITE_FROM_ROOT"
+  if [ -z "$REWRITE_SOURCE" ]; then
+    REWRITE_SOURCE="$PAPERCLIP_HOST_PROJECT_ROOT"
+  fi
+
+  if [ -n "$REWRITE_SOURCE" ] && [ "$REWRITE_SOURCE" != "$PAPERCLIP_CANONICAL_PROJECT_ROOT" ]; then
+    env \
+      PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+      PAPERCLIP_INSTANCE_ID="$PAPERCLIP_INSTANCE_ID" \
+      node /app/scripts/paperclip-rewrite-paths.mjs \
+        "$REWRITE_SOURCE" \
+        "$PAPERCLIP_CANONICAL_PROJECT_ROOT"
+  fi
+
+  exec paperclipai run --config "$PAPERCLIP_CONFIG"
+fi
+
+exec paperclipai onboard --config "$PAPERCLIP_CONFIG" --yes

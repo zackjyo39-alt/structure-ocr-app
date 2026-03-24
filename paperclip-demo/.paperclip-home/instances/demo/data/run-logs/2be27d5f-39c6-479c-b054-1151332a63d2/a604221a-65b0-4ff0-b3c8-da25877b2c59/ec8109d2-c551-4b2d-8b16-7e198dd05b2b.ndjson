@@ -1,0 +1,6 @@
+{"ts":"2026-03-23T13:03:45.179Z","stream":"stdout","chunk":"{\"type\":\"thread.started\",\"thread_id\":\"019d1814-646d-72d2-a5b8-1e872ed643b8\"}\n"}
+{"ts":"2026-03-23T13:03:45.185Z","stream":"stdout","chunk":"{\"type\":\"turn.started\"}\n"}
+{"ts":"2026-03-23T13:03:45.848Z","stream":"stderr","chunk":"2026-03-23T13:03:45.847896Z  WARN codex_core::shell_snapshot: Failed to delete shell snapshot at \"/Users/[]/.codex/shell_snapshots/019d1814-646d-72d2-a5b8-1e872ed643b8.tmp-1774271025173687000\": Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\n"}
+{"ts":"2026-03-23T13:03:48.510Z","stream":"stderr","chunk":"2026-03-23T13:03:48.510185Z  WARN codex_rmcp_client::rmcp_client: Failed to terminate MCP process group 4198: Operation not permitted (os error 1)\n"}
+{"ts":"2026-03-23T13:03:53.259Z","stream":"stdout","chunk":"{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}\n"}
+{"ts":"2026-03-23T13:03:53.262Z","stream":"stdout","chunk":"{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}}\n"}

@@ -1,0 +1,1 @@
+/Users/rock.xu/github/projects/ai-ml/paperclip-demo/runtime/node_modules/@embedded-postgres/darwin-arm64/native/bin/postgres "-D" "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/db" "-p" "54329"

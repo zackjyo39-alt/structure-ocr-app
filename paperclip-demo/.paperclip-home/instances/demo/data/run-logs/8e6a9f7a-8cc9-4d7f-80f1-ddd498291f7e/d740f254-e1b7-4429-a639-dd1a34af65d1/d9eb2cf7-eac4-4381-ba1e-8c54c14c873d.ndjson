@@ -1,0 +1,3 @@
+{"ts":"2026-03-23T19:42:47.171Z","stream":"stdout","chunk":"[paperclip] No project or prior session workspace was available. Using fallback workspace \"/Users/[]/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/workspaces/d740f254-e1b7-4429-a639-dd1a34af65d1\" for this run.\n"}
+{"ts":"2026-03-23T19:42:47.174Z","stream":"stdout","chunk":"[paperclip] Loaded agent instructions file: /Users/[]/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/workspaces/d740f254-e1b7-4429-a639-dd1a34af65d1/agents/ceo/AGENTS.md\n"}
+{"ts":"2026-03-23T19:43:17.933Z","stream":"stderr","chunk":"Error: timed out waiting for cloud requirements after 15s\n"}

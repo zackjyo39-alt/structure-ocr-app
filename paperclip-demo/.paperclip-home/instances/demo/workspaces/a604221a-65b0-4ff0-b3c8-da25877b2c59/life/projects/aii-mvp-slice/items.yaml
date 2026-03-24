@@ -1,0 +1,20 @@
+items:
+  - id: fact-2026-03-23-aii3-plan-created
+    type: project_update
+    status: active
+    confidence: high
+    source: heartbeat_execution
+    created_at: "2026-03-23T00:33:00Z"
+    accessed_at: "2026-03-23T00:33:00Z"
+    access_count: 1
+    fact: "Issue AII-3 plan document was created with MVP scope, architecture baseline, success metrics, and 4-week milestones."
+
+  - id: fact-2026-03-23-aii3-handoff-fe
+    type: project_update
+    status: active
+    confidence: high
+    source: issue_comment
+    created_at: "2026-03-23T00:33:11Z"
+    accessed_at: "2026-03-23T00:33:11Z"
+    access_count: 1
+    fact: "AII-3 was reassigned from CEO to Founding Engineer after plan approval for execution decomposition."

@@ -1,0 +1,4 @@
+{"ts":"2026-03-23T12:49:54.193Z","stream":"stdout","chunk":"[paperclip] Skipping saved session resume for task \"4d077874-f040-4973-a1e2-d1e8a99914c5\" because wake reason is issue_assigned.\n"}
+{"ts":"2026-03-23T12:50:00.325Z","stream":"stderr","chunk":"Warning: 'p' is not in the list of known options, but still passed to Electron/Chromium.\n"}
+{"ts":"2026-03-23T12:50:00.326Z","stream":"stderr","chunk":"Warning: 'output-format' is not in the list of known options, but still passed to Electron/Chromium.\nWarning: 'workspace' is not in the list of known options, but still passed to Electron/Chromium.\nWarning: 'model' is not in the list of known options, but still passed to Electron/Chromium.\nWarning: 'yolo' is not in the list of known options, but still passed to Electron/Chromium.\n"}
+{"ts":"2026-03-23T12:50:00.329Z","stream":"stdout","chunk":"Run with 'cursor -' to read from stdin (e.g. 'ps aux | grep code | cursor -').\n"}

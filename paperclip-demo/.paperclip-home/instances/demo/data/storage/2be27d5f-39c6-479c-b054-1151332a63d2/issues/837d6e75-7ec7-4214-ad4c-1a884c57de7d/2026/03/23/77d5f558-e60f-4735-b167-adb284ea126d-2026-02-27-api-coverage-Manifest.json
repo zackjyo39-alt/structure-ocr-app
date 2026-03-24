@@ -1,0 +1,27 @@
+[
+  {
+    "file": "src/services/knowledge.service.ts",
+    "action": "created",
+    "description": "Knowledge service - add, getEntry, search, getBySymbol, getSummary, getLatestSignals, deleteEntry, getStats"
+  },
+  {
+    "file": "src/services/market.service.ts",
+    "action": "created",
+    "description": "Market service - getQuote, getHistory, search, getStatus"
+  },
+  {
+    "file": "src/services/portfolio.service.ts",
+    "action": "modified",
+    "description": "Added closePosition and closeAll methods"
+  },
+  {
+    "file": "src/services/langgraph-viz.service.ts",
+    "action": "created",
+    "description": "LangGraph Viz service - getMermaid, getStructure, getState, getLLMConfig"
+  },
+  {
+    "file": "src/test/api-coverage.test.ts",
+    "action": "created",
+    "description": "Manual API coverage test with browser console helper"
+  }
+]

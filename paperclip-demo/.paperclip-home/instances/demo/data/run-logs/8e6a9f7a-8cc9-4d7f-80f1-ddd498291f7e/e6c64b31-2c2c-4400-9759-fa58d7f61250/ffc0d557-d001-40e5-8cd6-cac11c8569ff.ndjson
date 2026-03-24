@@ -1,0 +1,7 @@
+{"ts":"2026-03-23T17:24:15.549Z","stream":"stdout","chunk":"[paperclip] No project or prior session workspace was available. Using fallback workspace \"/Users/[]/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/workspaces/e6c64b31-2c2c-4400-9759-fa58d7f61250\" for this run.\n"}
+{"ts":"2026-03-23T17:24:20.173Z","stream":"stdout","chunk":"{\"type\":\"thread.started\",\"thread_id\":\"019d1809-7f0e-7ae2-931f-fa0d7817e70f\"}\n"}
+{"ts":"2026-03-23T17:24:20.175Z","stream":"stdout","chunk":"{\"type\":\"turn.started\"}\n"}
+{"ts":"2026-03-23T17:24:20.671Z","stream":"stderr","chunk":"2026-03-23T17:24:20.670865Z  WARN codex_core::shell_snapshot: Failed to delete shell snapshot at \"/Users/[]/.codex/shell_snapshots/019d1809-7f0e-7ae2-931f-fa0d7817e70f.tmp-1774286660140112000\": Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\n"}
+{"ts":"2026-03-23T17:24:22.880Z","stream":"stderr","chunk":"2026-03-23T17:24:22.880600Z  WARN codex_rmcp_client::rmcp_client: Failed to terminate MCP process group 44581: Operation not permitted (os error 1)\n"}
+{"ts":"2026-03-23T17:24:25.723Z","stream":"stdout","chunk":"{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}\n"}
+{"ts":"2026-03-23T17:24:25.727Z","stream":"stdout","chunk":"{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}}\n"}

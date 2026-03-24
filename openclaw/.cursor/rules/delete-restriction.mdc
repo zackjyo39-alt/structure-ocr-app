@@ -1,0 +1,21 @@
+---
+description: Restrict AI file deletion to only files under the github/ directory
+alwaysApply: true
+---
+
+# File Deletion Restriction
+
+**All file delete operations are restricted to paths under `/Users/rock.xu/github/` only.**
+
+## Rules
+
+- ONLY delete files whose absolute path starts with `/Users/rock.xu/github/`
+- NEVER delete any file outside of `/Users/rock.xu/github/`, even if the user requests it
+- If a delete is requested for a path outside `/Users/rock.xu/github/`, refuse and explain the restriction
+- This applies to all delete methods: the Delete tool, `rm`, `rm -rf`, `trash`, `unlink`, or any other file removal command
+
+## Before Any Delete
+
+1. Resolve the full absolute path of the target file/directory
+2. Verify the path starts with `/Users/rock.xu/github/`
+3. If it does NOT, refuse the deletion and inform the user

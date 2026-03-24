@@ -1,0 +1,18 @@
+{
+  "issues": [
+    {
+      "id": "ISSUE-1",
+      "title": "Improve onboarding docs",
+      "assignee": "principal_architect",
+      "status": "To Do",
+      "comments": []
+    },
+    {
+      "id": "ISSUE-2",
+      "title": "Refactor config loader",
+      "assignee": "another_assignee",
+      "status": "In Progress",
+      "comments": []
+    }
+  ]
+}

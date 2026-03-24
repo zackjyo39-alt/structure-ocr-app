@@ -1,0 +1,36 @@
+services:
+  paperclip:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        PAPERCLIP_VERSION: ${PAPERCLIP_VERSION:-2026.318.0}
+    image: paperclip-local:${PAPERCLIP_VERSION:-2026.318.0}
+    container_name: paperclip
+    restart: unless-stopped
+    working_dir: /workspace/paperclip-demo
+    ports:
+      - "127.0.0.1:${PAPERCLIP_SERVER_PORT:-3100}:3100"
+    environment:
+      PAPERCLIP_HOME: /data/paperclip
+      CODEX_HOME: /data/codex-home
+      PAPERCLIP_INSTANCE_ID: ${PAPERCLIP_INSTANCE_ID:-demo}
+      PAPERCLIP_CONFIG: /data/paperclip/config.json
+      PAPERCLIP_DEPLOYMENT_MODE: ${PAPERCLIP_DEPLOYMENT_MODE:-authenticated}
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: ${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}
+      PAPERCLIP_CANONICAL_PROJECT_ROOT: /workspace/paperclip-demo
+      PAPERCLIP_HOST_PROJECT_ROOT: ${PWD}
+      PAPERCLIP_REWRITE_FROM_ROOT: ${PAPERCLIP_REWRITE_FROM_ROOT:-}
+      PAPERCLIP_PUBLIC_URL: ${PAPERCLIP_PUBLIC_URL:-http://localhost:${PAPERCLIP_SERVER_PORT:-3100}}
+      PAPERCLIP_ALLOWED_HOSTNAMES: ${PAPERCLIP_ALLOWED_HOSTNAMES:-localhost,127.0.0.1}
+      HOST: 0.0.0.0
+      PORT: 3100
+      SERVE_UI: ${SERVE_UI:-true}
+      PAPERCLIP_OPEN_ON_LISTEN: "false"
+      PAPERCLIP_DB_BACKUP_ENABLED: ${PAPERCLIP_DB_BACKUP_ENABLED:-true}
+      PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES: ${PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES:-60}
+      PAPERCLIP_DB_BACKUP_RETENTION_DAYS: ${PAPERCLIP_DB_BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - ./.paperclip-home:/data/paperclip
+      - ./.codex-home:/data/codex-home
+      - ./:/workspace/paperclip-demo

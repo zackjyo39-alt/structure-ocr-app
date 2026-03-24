@@ -1,0 +1,53 @@
+{
+  "$meta": {
+    "version": 1,
+    "updatedAt": "2026-03-23T11:39:42.388Z",
+    "source": "configure"
+  },
+  "database": {
+    "mode": "embedded-postgres",
+    "embeddedPostgresDataDir": "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/db",
+    "embeddedPostgresPort": 54329,
+    "backup": {
+      "enabled": true,
+      "intervalMinutes": 60,
+      "retentionDays": 30,
+      "dir": "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/data/backups"
+    }
+  },
+  "logging": {
+    "mode": "file",
+    "logDir": "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/logs"
+  },
+  "server": {
+    "deploymentMode": "local_trusted",
+    "exposure": "private",
+    "host": "127.0.0.1",
+    "port": 3100,
+    "allowedHostnames": [],
+    "serveUi": true
+  },
+  "auth": {
+    "baseUrlMode": "auto",
+    "disableSignUp": false
+  },
+  "storage": {
+    "provider": "local_disk",
+    "localDisk": {
+      "baseDir": "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/data/storage"
+    },
+    "s3": {
+      "bucket": "paperclip",
+      "region": "us-east-1",
+      "prefix": "",
+      "forcePathStyle": false
+    }
+  },
+  "secrets": {
+    "provider": "local_encrypted",
+    "strictMode": false,
+    "localEncrypted": {
+      "keyFilePath": "/Users/rock.xu/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/secrets/master.key"
+    }
+  }
+}

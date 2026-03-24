@@ -1,0 +1,2 @@
+{"ts":"2026-03-23T18:28:20.849Z","stream":"stdout","chunk":"[paperclip] No project or prior session workspace was available. Using fallback workspace \"/Users/[]/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/workspaces/d16dd285-f277-4a21-9919-32de28ce49b1\" for this run.\n"}
+{"ts":"2026-03-23T18:29:31.807Z","stream":"stderr","chunk":"Error: [unavailable] getaddrinfo ENOTFOUND api2.cursor.sh\n"}

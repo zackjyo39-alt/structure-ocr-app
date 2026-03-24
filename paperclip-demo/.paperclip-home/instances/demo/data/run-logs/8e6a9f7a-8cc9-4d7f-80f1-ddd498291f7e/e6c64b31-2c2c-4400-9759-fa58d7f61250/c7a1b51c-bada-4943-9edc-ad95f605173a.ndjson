@@ -1,0 +1,8 @@
+{"ts":"2026-03-23T15:23:23.440Z","stream":"stdout","chunk":"[paperclip] No project or prior session workspace was available. Using fallback workspace \"/Users/[]/github/projects/ai-ml/paperclip-demo/.paperclip-home/instances/demo/workspaces/e6c64b31-2c2c-4400-9759-fa58d7f61250\" for this run.\n"}
+{"ts":"2026-03-23T15:23:29.502Z","stream":"stderr","chunk":"2026-03-23T15:23:29.501617Z ERROR codex_core::models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n"}
+{"ts":"2026-03-23T15:23:29.591Z","stream":"stdout","chunk":"{\"type\":\"thread.started\",\"thread_id\":\"019d1809-7f0e-7ae2-931f-fa0d7817e70f\"}\n"}
+{"ts":"2026-03-23T15:23:29.594Z","stream":"stdout","chunk":"{\"type\":\"turn.started\"}\n"}
+{"ts":"2026-03-23T15:23:30.075Z","stream":"stderr","chunk":"2026-03-23T15:23:30.075341Z  WARN codex_core::shell_snapshot: Failed to delete shell snapshot at \"/Users/[]/.codex/shell_snapshots/019d1809-7f0e-7ae2-931f-fa0d7817e70f.tmp-1774279409547333000\": Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\n"}
+{"ts":"2026-03-23T15:23:34.218Z","stream":"stderr","chunk":"2026-03-23T15:23:34.217954Z  WARN codex_rmcp_client::rmcp_client: Failed to terminate MCP process group 31447: Operation not permitted (os error 1)\n"}
+{"ts":"2026-03-23T15:23:42.585Z","stream":"stdout","chunk":"{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}\n"}
+{"ts":"2026-03-23T15:23:42.587Z","stream":"stdout","chunk":"{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Try again at Mar 27th, 2026 10:16 AM.\"}}\n"}
