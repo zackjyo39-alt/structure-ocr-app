@@ -22,10 +22,10 @@ AII-11 MVP Plan: Unified Data Backbone
   - AII-11 MVP plan document (this file) and a lightweight schema diagram.
   - Starter code scaffold (minimal) to illustrate the interface and data flow.
 
-- Ownership and notes
-  - Owner: bee1828f-9230-4522-9ade-08278be5ccd4
-  - Status: To Do (will be moved to In Progress when started)
+ - Ownership and notes
+   - Owner: bee1828f-9230-4522-9ade-08278be5ccd4
+   - Status: In Progress (plan defined in AII-11-plan.md)
 
 - Definition of Done
-  - Plan reviewed and approved in Inbox.
+  - Plan defined in AII-11-plan.md; awaiting review.
   - Requirements and design committed in repository, ready for implementation.
