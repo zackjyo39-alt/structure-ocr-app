@@ -1,0 +1,35 @@
+---
+description: Prefer OpenViking MCP for stored project memory, RAG search, and ingesting docs when relevant
+alwaysApply: true
+---
+
+# OpenViking 上下文（Cursor）
+
+当用户问题涉及 **跨会话记忆、已入库文档、团队约定、或应用内「之前存过」的知识** 时，应优先使用 **MCP 工具 `openviking`**（若已在 Cursor 中启用并连接成功）。
+
+## 前提
+
+1. **OpenViking 主服务**（HTTP API，常见 `http://127.0.0.1:1933`）已运行 — 负责存储与索引。
+2. **OpenViking MCP 服务**（常见 `http://127.0.0.1:2033/mcp`）已运行 — Cursor 通过 MCP 调用工具。  
+   在 OpenViking 仓库中执行：`./deploy/start-openviking-mcp-for-cursor.sh`  
+   若连接失败，提醒用户先启动该脚本并检查 Cursor → MCP 中 `openviking` 是否已开启。
+
+## 可用能力（与官方 MCP 一致）
+
+| 工具 | 用途 |
+|------|------|
+| **search** | 仅语义检索，返回 `viking://` 等匹配片段 |
+| **query** | 检索 + 用配置的 LLM 生成回答（带引用） |
+| **add_resource** | 将本地路径、目录或 URL 加入索引 |
+
+## 行为约定
+
+- 需要 **查已有知识** → 先用 **search**；要 **直接要答案并带出处** → 用 **query**。
+- 用户给出新仓库/文档链接并希望长期可查 → **add_resource**。
+- **不要**把 OpenViking 与「仅当前聊天窗口」混为一谈；持久内容以 **OpenViking workspace 目录** 为准。
+- 若 MCP 未连接，可说明限制，并建议用户启动 MCP 或使用 OpenCode 侧已配置的 `memsearch` 插件作为替代流程。
+
+## 与 OpenCode 的关系
+
+- **OpenCode**：使用 `~/.config/opencode/plugins/openviking-memory.ts`（memsearch / memread 等）。  
+- **Cursor**：使用本规则 + **MCP `openviking`**。两者可指向 **同一 `OV_DATA` workspace**，数据一致。
