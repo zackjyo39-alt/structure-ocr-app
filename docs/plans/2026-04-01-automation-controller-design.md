@@ -11,6 +11,8 @@ This controller is intentionally small. It does not call external tool APIs dire
 - selects the next slice
 - chooses the active tool
 - writes execution packets
+- dispatches packets into tool-specific inbox directories
+- reads tool-specific result payloads
 - records handoff and task state
 
 That is enough to move the project from "manual prompt copying" to "repository-driven task automation."
@@ -23,6 +25,8 @@ The controller should support:
 - `next`: pick the next queued task and assign the active tool
 - `handoff`: record the result of a slice and update task status
 - `packet`: generate a tool-ready execution packet for the current slice
+- `dispatch`: deliver the packet into the assigned tool inbox
+- `collect`: read the tool result payload from the results directory
 
 It should not yet:
 
@@ -40,6 +44,8 @@ It should not yet:
 ## Outputs
 
 - `automation/outbox/current-task.md`
+- `automation/inbox/<tool>/*.md`
+- `automation/results/<tool>/*.json`
 - `automation/handoffs/*.md`
 - updated `automation/state.json`
 - updated `automation/tasks.json`
@@ -74,4 +80,3 @@ Run state tracks:
 ## Decision
 
 Use a Python controller with standard-library-only logic so the automation layer stays lightweight and easy to run locally.
-

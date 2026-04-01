@@ -20,3 +20,5 @@ dist/
 # Automation runtime output
 automation/outbox/current-task.md
 automation/handoffs/*.md
+automation/inbox/**/*.md
+automation/results/**/*.json

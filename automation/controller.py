@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from automation.adapters.factory import get_adapter
+
+
 AUTOMATION_DIR = ROOT / "automation"
 CONFIG_PATH = ROOT / "config" / "tool-routing.yaml"
 TASKS_PATH = AUTOMATION_DIR / "tasks.json"
 STATE_PATH = AUTOMATION_DIR / "state.json"
 OUTBOX_DIR = AUTOMATION_DIR / "outbox"
 HANDOFF_DIR = AUTOMATION_DIR / "handoffs"
+INBOX_DIR = AUTOMATION_DIR / "inbox"
+RESULTS_DIR = AUTOMATION_DIR / "results"
 
 
 def now_stamp() -> str:
@@ -71,6 +79,8 @@ class ControllerContext:
 def load_context() -> ControllerContext:
     OUTBOX_DIR.mkdir(exist_ok=True)
     HANDOFF_DIR.mkdir(exist_ok=True)
+    INBOX_DIR.mkdir(exist_ok=True)
+    RESULTS_DIR.mkdir(exist_ok=True)
     routing = parse_simple_yaml(CONFIG_PATH)
     tasks = load_json(TASKS_PATH)
     state = load_json(STATE_PATH)
@@ -191,6 +201,43 @@ def command_packet(ctx: ControllerContext) -> int:
     return 0
 
 
+def command_dispatch(ctx: ControllerContext) -> int:
+    tasks = ctx.tasks["tasks"]
+    task = get_task_by_id(tasks, ctx.state.get("current_task_id"))
+    if not task:
+        print("No active task to dispatch.")
+        return 1
+    tool = ctx.state.get("current_tool") or choose_tool(task, ctx.routing)
+    adapter = get_adapter(tool)
+    packet_text = render_packet(task, tool, ctx.routing)
+    inbox_dir = INBOX_DIR / tool
+    result = adapter.dispatch(task["id"], packet_text, inbox_dir)
+    ctx.state["last_packet_path"] = str(result.packet_path.relative_to(ROOT)) if result.packet_path else None
+    save_json(STATE_PATH, ctx.state)
+    print(json.dumps({
+        "dispatched_task": task["id"],
+        "tool": tool,
+        "packet": str(result.packet_path.relative_to(ROOT)) if result.packet_path else None,
+    }, indent=2))
+    return 0
+
+
+def command_collect(ctx: ControllerContext) -> int:
+    tasks = ctx.tasks["tasks"]
+    task = get_task_by_id(tasks, ctx.state.get("current_task_id"))
+    if not task:
+        print("No active task to collect.")
+        return 1
+    tool = ctx.state.get("current_tool") or choose_tool(task, ctx.routing)
+    adapter = get_adapter(tool)
+    result = adapter.collect(task["id"], RESULTS_DIR / tool)
+    if result.result_path is None:
+        print(json.dumps({"task": task["id"], "tool": tool, "result": None}, indent=2))
+        return 0
+    print(result.result_path.read_text())
+    return 0
+
+
 def command_handoff(ctx: ControllerContext, result: str, summary: str) -> int:
     tasks = ctx.tasks["tasks"]
     task = get_task_by_id(tasks, ctx.state.get("current_task_id"))
@@ -236,6 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status")
     subparsers.add_parser("next")
     subparsers.add_parser("packet")
+    subparsers.add_parser("dispatch")
+    subparsers.add_parser("collect")
     handoff = subparsers.add_parser("handoff")
     handoff.add_argument("--result", choices=["done", "blocked", "requeue"], required=True)
     handoff.add_argument("--summary", required=True)
@@ -252,6 +301,10 @@ def main() -> int:
         return command_next(ctx)
     if args.command == "packet":
         return command_packet(ctx)
+    if args.command == "dispatch":
+        return command_dispatch(ctx)
+    if args.command == "collect":
+        return command_collect(ctx)
     if args.command == "handoff":
         return command_handoff(ctx, args.result, args.summary)
     return 1
@@ -259,4 +312,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
