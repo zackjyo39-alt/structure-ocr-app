@@ -1,0 +1,33 @@
+primary_control_plane: opencode
+primary_implementation: codex
+secondary_implementation: opencode
+tertiary_review: cursor
+
+workload_share:
+  opencode: 20
+  codex: 70
+  cursor: 10
+
+routing:
+  planning: opencode
+  orchestration: opencode
+  implementation: codex
+  repair_loop: codex
+  ui_patch: cursor
+  narrow_review: cursor
+
+fallback_on_quota_exhausted:
+  codex: opencode
+  opencode: cursor
+  cursor: opencode
+
+fallback_on_timeout:
+  codex: opencode
+  opencode: codex
+  cursor: opencode
+
+switch_rules:
+  require_handoff: true
+  one_active_implementation_owner_per_slice: true
+  preserve_slice_scope_on_reassignment: true
+
