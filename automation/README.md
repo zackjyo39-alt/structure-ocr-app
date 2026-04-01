@@ -25,6 +25,8 @@ python3 automation/controller.py next
 python3 automation/controller.py packet
 python3 automation/controller.py dispatch
 python3 automation/controller.py collect
+python3 automation/controller.py complete
+python3 automation/controller.py reassign --reason "quota exhausted"
 python3 automation/controller.py handoff --result done --summary "slice completed"
 ```
 
@@ -44,7 +46,11 @@ python3 automation/controller.py handoff --result done --summary "slice complete
 2. `dispatch` writes the task packet into the assigned tool inbox.
 3. The assigned tool executes the slice and writes a result payload into its results directory.
 4. `collect` reads the result payload.
-5. `handoff` records the result and updates the queue/state.
+5. `complete` automatically writes handoff and marks the active task done.
+6. `reassign` automatically writes handoff and moves the active task to the fallback tool.
+
+`complete` and `reassign` are the preferred path once a tool has written a result JSON.
+Manual `handoff` remains available as a fallback for exceptional cases.
 
 ## OpenCode Entry
 

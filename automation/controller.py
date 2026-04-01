@@ -101,6 +101,12 @@ def choose_tool(task: dict[str, Any], routing: dict[str, Any]) -> str:
     return routing.get("primary_implementation", "opencode")
 
 
+def choose_fallback(tool: str | None, routing: dict[str, Any]) -> str | None:
+    if not tool:
+        return routing.get("secondary_implementation")
+    return routing.get("fallback_on_quota_exhausted", {}).get(tool, routing.get("secondary_implementation"))
+
+
 def render_packet(task: dict[str, Any], tool: str, routing: dict[str, Any]) -> str:
     verification = "\n".join(f"- {item}" for item in task.get("verification", []))
     files = "\n".join(f"- {item}" for item in task.get("files", []))
@@ -133,6 +139,36 @@ Execution Rules:
 - verify after changes
 - if blocked, produce a handoff note before reassigning
 """
+
+
+def write_handoff(task: dict[str, Any], tool: str | None, result: str, summary: str) -> Path:
+    handoff_path = HANDOFF_DIR / f"{now_stamp()}-{task['id']}.md"
+    handoff_path.write_text(
+        f"""# Handoff
+
+Task ID: {task['id']}
+Tool: {tool}
+Result: {result}
+
+Summary:
+{summary}
+"""
+    )
+    return handoff_path
+
+
+def load_active_result(ctx: ControllerContext) -> tuple[dict[str, Any], dict[str, Any], str, Path] | None:
+    tasks = ctx.tasks["tasks"]
+    task = get_task_by_id(tasks, ctx.state.get("current_task_id"))
+    if not task:
+        return None
+    tool = ctx.state.get("current_tool") or choose_tool(task, ctx.routing)
+    adapter = get_adapter(tool)
+    result = adapter.collect(task["id"], RESULTS_DIR / tool)
+    if result.result_path is None:
+        return None
+    payload = load_json(result.result_path)
+    return task, payload, tool, result.result_path
 
 
 def command_status(ctx: ControllerContext) -> int:
@@ -223,18 +259,12 @@ def command_dispatch(ctx: ControllerContext) -> int:
 
 
 def command_collect(ctx: ControllerContext) -> int:
-    tasks = ctx.tasks["tasks"]
-    task = get_task_by_id(tasks, ctx.state.get("current_task_id"))
-    if not task:
+    loaded = load_active_result(ctx)
+    if loaded is None:
         print("No active task to collect.")
         return 1
-    tool = ctx.state.get("current_tool") or choose_tool(task, ctx.routing)
-    adapter = get_adapter(tool)
-    result = adapter.collect(task["id"], RESULTS_DIR / tool)
-    if result.result_path is None:
-        print(json.dumps({"task": task["id"], "tool": tool, "result": None}, indent=2))
-        return 0
-    print(result.result_path.read_text())
+    task, payload, tool, result_path = loaded
+    print(json.dumps({"task": task["id"], "tool": tool, "result_path": str(result_path.relative_to(ROOT)), "payload": payload}, indent=2))
     return 0
 
 
@@ -245,18 +275,7 @@ def command_handoff(ctx: ControllerContext, result: str, summary: str) -> int:
         print("No active task to hand off.")
         return 1
     tool = ctx.state.get("current_tool")
-    handoff_path = HANDOFF_DIR / f"{now_stamp()}-{task['id']}.md"
-    handoff_path.write_text(
-        f"""# Handoff
-
-Task ID: {task['id']}
-Tool: {tool}
-Result: {result}
-
-Summary:
-{summary}
-"""
-    )
+    handoff_path = write_handoff(task, tool, result, summary)
     if result == "done":
         task["status"] = "done"
         ctx.state["current_task_id"] = None
@@ -276,6 +295,54 @@ Summary:
     return 0
 
 
+def command_complete(ctx: ControllerContext) -> int:
+    loaded = load_active_result(ctx)
+    if loaded is None:
+        print("No active result available to complete.")
+        return 1
+    task, payload, tool, _ = loaded
+    summary = payload.get("summary", "task completed")
+    handoff_path = write_handoff(task, tool, "done", summary)
+    task["status"] = "done"
+    ctx.state["current_task_id"] = None
+    ctx.state["current_tool"] = None
+    ctx.state["last_handoff_path"] = str(handoff_path.relative_to(ROOT))
+    save_json(TASKS_PATH, ctx.tasks)
+    save_json(STATE_PATH, ctx.state)
+    print(json.dumps({
+        "completed_task": task["id"],
+        "tool": tool,
+        "handoff": str(handoff_path.relative_to(ROOT)),
+        "summary": summary,
+    }, indent=2))
+    return 0
+
+
+def command_reassign(ctx: ControllerContext, reason: str | None) -> int:
+    loaded = load_active_result(ctx)
+    if loaded is None:
+        print("No active result available to reassign.")
+        return 1
+    task, payload, tool, _ = loaded
+    summary = reason or payload.get("summary", "task blocked and reassigned")
+    fallback_tool = choose_fallback(tool, ctx.routing)
+    handoff_path = write_handoff(task, tool, "blocked", summary)
+    task["status"] = "queued"
+    ctx.state["current_task_id"] = task["id"]
+    ctx.state["current_tool"] = fallback_tool
+    ctx.state["last_handoff_path"] = str(handoff_path.relative_to(ROOT))
+    save_json(TASKS_PATH, ctx.tasks)
+    save_json(STATE_PATH, ctx.state)
+    print(json.dumps({
+        "reassigned_task": task["id"],
+        "from_tool": tool,
+        "to_tool": fallback_tool,
+        "handoff": str(handoff_path.relative_to(ROOT)),
+        "summary": summary,
+    }, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Structure-OCR automation controller")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -285,6 +352,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("packet")
     subparsers.add_parser("dispatch")
     subparsers.add_parser("collect")
+    subparsers.add_parser("complete")
+    reassign = subparsers.add_parser("reassign")
+    reassign.add_argument("--reason", required=False)
     handoff = subparsers.add_parser("handoff")
     handoff.add_argument("--result", choices=["done", "blocked", "requeue"], required=True)
     handoff.add_argument("--summary", required=True)
@@ -305,6 +375,10 @@ def main() -> int:
         return command_dispatch(ctx)
     if args.command == "collect":
         return command_collect(ctx)
+    if args.command == "complete":
+        return command_complete(ctx)
+    if args.command == "reassign":
+        return command_reassign(ctx, args.reason)
     if args.command == "handoff":
         return command_handoff(ctx, args.result, args.summary)
     return 1
