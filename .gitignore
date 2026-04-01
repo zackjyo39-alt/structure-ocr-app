@@ -16,3 +16,7 @@ dist/
 # Local env
 .env
 .env.*
+
+# Automation runtime output
+automation/outbox/current-task.md
+automation/handoffs/*.md

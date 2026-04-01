@@ -1,0 +1,47 @@
+{
+  "tasks": [
+    {
+      "id": "phase1-frontend-workspace",
+      "title": "Build the workspace UI shell to match the split-view dark design",
+      "kind": "implementation",
+      "scope": "frontend workspace shell only",
+      "files": [
+        "frontend/src/main.jsx",
+        "frontend/index.html"
+      ],
+      "verification": [
+        "npm run build"
+      ],
+      "status": "queued"
+    },
+    {
+      "id": "phase1-backend-integration",
+      "title": "Verify frontend upload flow matches backend extract contract",
+      "kind": "repair_loop",
+      "scope": "frontend/backend contract alignment",
+      "files": [
+        "frontend/src/main.jsx",
+        "backend/app/main.py",
+        "backend/app/ocr.py"
+      ],
+      "verification": [
+        "PYTHONPATH=backend .venv311/bin/pytest backend/tests -q",
+        "npm run build"
+      ],
+      "status": "queued"
+    },
+    {
+      "id": "phase1-smoke-runbook",
+      "title": "Document exact local run and smoke test steps for Phase 1",
+      "kind": "planning",
+      "scope": "readme and runbook only",
+      "files": [
+        "README.md"
+      ],
+      "verification": [
+        "manual doc review"
+      ],
+      "status": "queued"
+    }
+  ]
+}
