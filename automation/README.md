@@ -8,6 +8,13 @@ The current execution model is adapter-based and file-driven:
 - each tool writes a result payload into `automation/results/<tool>/`
 - the controller collects the result and advances state
 
+OpenCode now has a dedicated adapter contract:
+
+- dispatched packets for OpenCode include runner instructions
+- OpenCode should consume `automation/inbox/opencode/<task-id>.md`
+- OpenCode should write results to `automation/results/opencode/<task-id>.json`
+- use `automation/result-schema.example.json` as the payload shape
+
 ## Commands
 
 Run from the repository root:
@@ -29,6 +36,7 @@ python3 automation/controller.py handoff --result done --summary "slice complete
 - `inbox/<tool>/`: dispatched packets for each tool
 - `results/<tool>/`: result payloads returned by each tool
 - `handoffs/`: handoff history
+- `result-schema.example.json`: example result payload shape
 
 ## Workflow
 
@@ -37,3 +45,9 @@ python3 automation/controller.py handoff --result done --summary "slice complete
 3. The assigned tool executes the slice and writes a result payload into its results directory.
 4. `collect` reads the result payload.
 5. `handoff` records the result and updates the queue/state.
+
+## OpenCode Entry
+
+Use this prompt when OpenCode is the active tool:
+
+- `prompts/opencode-automation-runner.md`
