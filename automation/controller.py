@@ -171,6 +171,28 @@ def load_active_result(ctx: ControllerContext) -> tuple[dict[str, Any], dict[str
     return task, payload, tool, result.result_path
 
 
+def select_next_task(ctx: ControllerContext) -> tuple[dict[str, Any], str, Path] | None:
+    tasks = ctx.tasks["tasks"]
+    current = get_task_by_id(tasks, ctx.state.get("current_task_id"))
+    if current and current.get("status") == "in_progress":
+        tool = ctx.state.get("current_tool") or choose_tool(current, ctx.routing)
+        packet_path = OUTBOX_DIR / "current-task.md"
+        return current, tool, packet_path
+    next_task = next((task for task in tasks if task["status"] == "queued"), None)
+    if not next_task:
+        return None
+    tool = choose_tool(next_task, ctx.routing)
+    next_task["status"] = "in_progress"
+    ctx.state["current_task_id"] = next_task["id"]
+    ctx.state["current_tool"] = tool
+    packet_path = OUTBOX_DIR / "current-task.md"
+    packet_path.write_text(render_packet(next_task, tool, ctx.routing))
+    ctx.state["last_packet_path"] = str(packet_path.relative_to(ROOT))
+    save_json(TASKS_PATH, ctx.tasks)
+    save_json(STATE_PATH, ctx.state)
+    return next_task, tool, packet_path
+
+
 def command_status(ctx: ControllerContext) -> int:
     tasks = ctx.tasks["tasks"]
     queued = sum(1 for task in tasks if task["status"] == "queued")
@@ -199,26 +221,12 @@ def command_status(ctx: ControllerContext) -> int:
 
 
 def command_next(ctx: ControllerContext) -> int:
-    tasks = ctx.tasks["tasks"]
-    current = get_task_by_id(tasks, ctx.state.get("current_task_id"))
-    if current and current.get("status") == "in_progress":
-        print(f"Current task already active: {current['id']}")
-        return 0
-    next_task = next((task for task in tasks if task["status"] == "queued"), None)
-    if not next_task:
+    selected = select_next_task(ctx)
+    if selected is None:
         print("No queued tasks.")
         return 0
-    tool = choose_tool(next_task, ctx.routing)
-    next_task["status"] = "in_progress"
-    ctx.state["current_task_id"] = next_task["id"]
-    ctx.state["current_tool"] = tool
-    packet = render_packet(next_task, tool, ctx.routing)
-    packet_path = OUTBOX_DIR / "current-task.md"
-    packet_path.write_text(packet)
-    ctx.state["last_packet_path"] = str(packet_path.relative_to(ROOT))
-    save_json(TASKS_PATH, ctx.tasks)
-    save_json(STATE_PATH, ctx.state)
-    print(json.dumps({"selected_task": next_task["id"], "tool": tool, "packet": str(packet_path.relative_to(ROOT))}, indent=2))
+    task, tool, packet_path = selected
+    print(json.dumps({"selected_task": task["id"], "tool": tool, "packet": str(packet_path.relative_to(ROOT))}, indent=2))
     return 0
 
 
@@ -343,6 +351,44 @@ def command_reassign(ctx: ControllerContext, reason: str | None) -> int:
     return 0
 
 
+def command_run_once(ctx: ControllerContext) -> int:
+    loaded = load_active_result(ctx)
+    if loaded is not None:
+        task, payload, tool, _ = loaded
+        result = payload.get("result")
+        if result == "done":
+            return command_complete(ctx)
+        if result in {"blocked", "reassign", "quota_exhausted", "timeout"}:
+            reason = payload.get("summary", "tool requested reassignment")
+            return command_reassign(ctx, reason)
+        print(json.dumps({
+            "task": task["id"],
+            "tool": tool,
+            "action": "waiting",
+            "reason": f"unsupported result value: {result}",
+        }, indent=2))
+        return 0
+
+    selected = select_next_task(ctx)
+    if selected is None:
+        print(json.dumps({"action": "idle", "reason": "no queued tasks"}, indent=2))
+        return 0
+    task, tool, _ = selected
+    adapter = get_adapter(tool)
+    packet_text = render_packet(task, tool, ctx.routing)
+    inbox_dir = INBOX_DIR / tool
+    result = adapter.dispatch(task["id"], packet_text, inbox_dir)
+    ctx.state["last_packet_path"] = str(result.packet_path.relative_to(ROOT)) if result.packet_path else None
+    save_json(STATE_PATH, ctx.state)
+    print(json.dumps({
+        "action": "dispatched",
+        "task": task["id"],
+        "tool": tool,
+        "packet": str(result.packet_path.relative_to(ROOT)) if result.packet_path else None,
+    }, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Structure-OCR automation controller")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -353,6 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("dispatch")
     subparsers.add_parser("collect")
     subparsers.add_parser("complete")
+    subparsers.add_parser("run-once")
     reassign = subparsers.add_parser("reassign")
     reassign.add_argument("--reason", required=False)
     handoff = subparsers.add_parser("handoff")
@@ -377,6 +424,8 @@ def main() -> int:
         return command_collect(ctx)
     if args.command == "complete":
         return command_complete(ctx)
+    if args.command == "run-once":
+        return command_run_once(ctx)
     if args.command == "reassign":
         return command_reassign(ctx, args.reason)
     if args.command == "handoff":

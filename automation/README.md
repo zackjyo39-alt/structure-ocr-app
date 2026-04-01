@@ -27,6 +27,7 @@ python3 automation/controller.py dispatch
 python3 automation/controller.py collect
 python3 automation/controller.py complete
 python3 automation/controller.py reassign --reason "quota exhausted"
+python3 automation/controller.py run-once
 python3 automation/controller.py handoff --result done --summary "slice completed"
 ```
 
@@ -48,9 +49,14 @@ python3 automation/controller.py handoff --result done --summary "slice complete
 4. `collect` reads the result payload.
 5. `complete` automatically writes handoff and marks the active task done.
 6. `reassign` automatically writes handoff and moves the active task to the fallback tool.
+7. `run-once` executes one controller loop:
+   - if there is a result JSON, it auto-completes or reassigns
+   - otherwise it selects and dispatches the next task
 
 `complete` and `reassign` are the preferred path once a tool has written a result JSON.
 Manual `handoff` remains available as a fallback for exceptional cases.
+
+`run-once` is the preferred operator entrypoint when you want the controller to advance state with minimal manual intervention.
 
 ## OpenCode Entry
 
