@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import io
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
-
-import fitz
-from PIL import Image
 
 
 @dataclass
@@ -52,6 +47,12 @@ class DocumentExtractor:
         return self._extract_image(raw, notes)
 
     def _extract_image(self, raw: bytes, notes: list[str]) -> dict:
+        try:
+            from PIL import Image
+        except ImportError:
+            notes.append("Pillow is not installed; cannot process image files.")
+            return {"pages": 1, "text": "", "blocks": [], "notes": notes}
+
         image = Image.open(io.BytesIO(raw)).convert("RGB")
         ocr = self._load_ocr()
         blocks: list[dict] = []
@@ -77,6 +78,18 @@ class DocumentExtractor:
         return {"pages": 1, "text": text, "blocks": blocks, "notes": notes}
 
     def _extract_pdf(self, raw: bytes, notes: list[str]) -> dict:
+        try:
+            import fitz
+        except ImportError:
+            notes.append("PyMuPDF is not installed; cannot process PDF files.")
+            return {"pages": 0, "text": "", "blocks": [], "notes": notes}
+
+        try:
+            from PIL import Image
+        except ImportError:
+            notes.append("Pillow is not installed; cannot process PDF pages.")
+            return {"pages": 0, "text": "", "blocks": [], "notes": notes}
+
         doc = fitz.open(stream=raw, filetype="pdf")
         blocks: list[dict] = []
         full_text: list[str] = []
@@ -146,4 +159,3 @@ class DocumentExtractor:
             "blocks": blocks,
             "notes": notes,
         }
-

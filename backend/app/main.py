@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-import fitz
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -71,4 +70,3 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
         blocks=[PageBlock(**block) for block in result["blocks"]],
         notes=result["notes"],
     )
-
