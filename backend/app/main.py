@@ -19,6 +19,7 @@ app.add_middleware(
 )
 
 extractor = DocumentExtractor()
+SUPPORTED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt"}
 
 
 class PageBlock(BaseModel):
@@ -50,8 +51,14 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-    checksum = hashlib.sha256(raw).hexdigest()
     suffix = Path(file.filename or "upload").suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported file type '{suffix}'; supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}",
+        )
+
+    checksum = hashlib.sha256(raw).hexdigest()
     mime_type = file.content_type or "application/octet-stream"
 
     result = extractor.extract(

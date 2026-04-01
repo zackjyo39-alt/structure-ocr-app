@@ -17,6 +17,9 @@ dist/
 .env
 .env.*
 
+# make start/stop pid + logs
+.run/
+
 # Automation runtime output
 automation/outbox/current-task.md
 automation/handoffs/*.md

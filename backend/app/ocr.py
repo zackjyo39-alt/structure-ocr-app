@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass
 
 
@@ -22,9 +23,10 @@ class DocumentExtractor:
         if self._ocr is not None:
             return self._ocr
         try:
+            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
             from paddleocr import PaddleOCR
 
-            self._ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+            self._ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
         except Exception:
             self._ocr = False
         return self._ocr
@@ -33,9 +35,10 @@ class DocumentExtractor:
         if self._structure is not None:
             return self._structure
         try:
+            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
             from paddleocr import PPStructure
 
-            self._structure = PPStructure(show_log=False, lang="ch")
+            self._structure = PPStructure(lang="ch")
         except Exception:
             self._structure = False
         return self._structure
@@ -66,7 +69,11 @@ class DocumentExtractor:
             notes.append("Pillow is not installed; cannot process image files.")
             return {"pages": 1, "text": "", "blocks": [], "notes": notes}
 
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
+        try:
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            notes.append("Could not open image file; the file may be corrupted or invalid.")
+            return {"pages": 0, "text": "", "blocks": [], "notes": notes}
         ocr = self._load_ocr()
         blocks: list[dict] = []
         text = ""
@@ -103,7 +110,11 @@ class DocumentExtractor:
             notes.append("Pillow is not installed; cannot process PDF pages.")
             return {"pages": 0, "text": "", "blocks": [], "notes": notes}
 
-        doc = fitz.open(stream=raw, filetype="pdf")
+        try:
+            doc = fitz.open(stream=raw, filetype="pdf")
+        except Exception:
+            notes.append("Could not open PDF file; the file may be corrupted or invalid.")
+            return {"pages": 0, "text": "", "blocks": [], "notes": notes}
         blocks: list[dict] = []
         full_text: list[str] = []
         ocr = self._load_ocr()

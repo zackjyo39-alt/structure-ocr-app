@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,6 +23,55 @@ OUTBOX_DIR = AUTOMATION_DIR / "outbox"
 HANDOFF_DIR = AUTOMATION_DIR / "handoffs"
 INBOX_DIR = AUTOMATION_DIR / "inbox"
 RESULTS_DIR = AUTOMATION_DIR / "results"
+
+NormalizedResult = Literal[
+    "done",
+    "blocked",
+    "reassign",
+    "waiting",
+    "quota_exhausted",
+    "timeout",
+    "unknown",
+]
+
+RunOnceOutcome = Literal[
+    "idle",
+    "dispatched",
+    "completed",
+    "reassigned",
+    "waiting",
+    "blocked_state",
+]
+
+
+def normalize_result_status(payload: dict[str, Any]) -> NormalizedResult:
+    raw = payload.get("result")
+    if raw is None:
+        return "waiting"
+    if not isinstance(raw, str):
+        return "unknown"
+    key = raw.strip().lower().replace("-", "_")
+    key = "_".join(part for part in key.split() if part)
+    synonyms: dict[str, NormalizedResult] = {
+        "pending": "waiting",
+        "in_progress": "waiting",
+        "complete": "done",
+        "completed": "done",
+        "success": "done",
+        "block": "blocked",
+        "quota": "quota_exhausted",
+        "quotaexhausted": "quota_exhausted",
+        "timed_out": "timeout",
+        "time_out": "timeout",
+    }
+    key = synonyms.get(key, key)
+    if key in {"done", "blocked", "reassign", "waiting", "quota_exhausted", "timeout"}:
+        return key
+    return "unknown"
+
+
+def result_status_triggers_reassign(status: NormalizedResult) -> bool:
+    return status in {"blocked", "reassign", "quota_exhausted", "timeout"}
 
 
 def now_stamp() -> str:
@@ -351,28 +400,60 @@ def command_reassign(ctx: ControllerContext, reason: str | None) -> int:
     return 0
 
 
-def command_run_once(ctx: ControllerContext) -> int:
+def run_once_step(ctx: ControllerContext) -> RunOnceOutcome:
+    tasks = ctx.tasks["tasks"]
+    current = get_task_by_id(tasks, ctx.state.get("current_task_id"))
+    if current and current.get("status") == "blocked":
+        print(json.dumps(
+            {
+                "action": "blocked_state",
+                "task": current["id"],
+                "reason": "active task is blocked; clear or hand off before continuing",
+            },
+            indent=2,
+        ))
+        return "blocked_state"
+
     loaded = load_active_result(ctx)
     if loaded is not None:
         task, payload, tool, _ = loaded
-        result = payload.get("result")
-        if result == "done":
-            return command_complete(ctx)
-        if result in {"blocked", "reassign", "quota_exhausted", "timeout"}:
+        status = normalize_result_status(payload)
+        if status == "done":
+            command_complete(ctx)
+            return "completed"
+        if result_status_triggers_reassign(status):
             reason = payload.get("summary", "tool requested reassignment")
-            return command_reassign(ctx, reason)
+            command_reassign(ctx, reason)
+            return "reassigned"
         print(json.dumps({
             "task": task["id"],
             "tool": tool,
             "action": "waiting",
-            "reason": f"unsupported result value: {result}",
+            "normalized": status,
+            "reason": (
+                "tool reports not finished"
+                if status == "waiting"
+                else f"unsupported result value: {payload.get('result')!r}"
+            ),
         }, indent=2))
-        return 0
+        return "waiting"
+
+    if current and current.get("status") == "in_progress":
+        tool = ctx.state.get("current_tool") or choose_tool(current, ctx.routing)
+        expected = RESULTS_DIR / tool / f"{current['id']}.json"
+        print(json.dumps({
+            "action": "waiting",
+            "task": current["id"],
+            "tool": tool,
+            "reason": "task in progress but no result JSON yet; write when ready",
+            "expected_result": str(expected.relative_to(ROOT)),
+        }, indent=2))
+        return "waiting"
 
     selected = select_next_task(ctx)
     if selected is None:
         print(json.dumps({"action": "idle", "reason": "no queued tasks"}, indent=2))
-        return 0
+        return "idle"
     task, tool, _ = selected
     adapter = get_adapter(tool)
     packet_text = render_packet(task, tool, ctx.routing)
@@ -385,6 +466,33 @@ def command_run_once(ctx: ControllerContext) -> int:
         "task": task["id"],
         "tool": tool,
         "packet": str(result.packet_path.relative_to(ROOT)) if result.packet_path else None,
+    }, indent=2))
+    return "dispatched"
+
+
+def command_run_once(ctx: ControllerContext) -> int:
+    run_once_step(ctx)
+    return 0
+
+
+def command_run_until_idle(ctx: ControllerContext, max_steps: int) -> int:
+    if max_steps < 1:
+        print(json.dumps({"error": "max_steps must be >= 1", "max_steps": max_steps}, indent=2))
+        return 1
+    stop_outcomes: frozenset[RunOnceOutcome] = frozenset({"idle", "waiting", "blocked_state"})
+    steps = 0
+    last: RunOnceOutcome | None = None
+    while steps < max_steps:
+        steps += 1
+        last = run_once_step(ctx)
+        if last in stop_outcomes:
+            break
+    print(json.dumps({
+        "action": "run_until_idle_finished",
+        "steps": steps,
+        "last_outcome": last,
+        "max_steps": max_steps,
+        "stopped_by_max_steps": steps >= max_steps and last not in stop_outcomes,
     }, indent=2))
     return 0
 
@@ -400,6 +508,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("collect")
     subparsers.add_parser("complete")
     subparsers.add_parser("run-once")
+    run_until_idle = subparsers.add_parser("run-until-idle")
+    run_until_idle.add_argument("--max-steps", type=int, default=50, metavar="N", help="max controller iterations (default: 50)")
     reassign = subparsers.add_parser("reassign")
     reassign.add_argument("--reason", required=False)
     handoff = subparsers.add_parser("handoff")
@@ -426,6 +536,8 @@ def main() -> int:
         return command_complete(ctx)
     if args.command == "run-once":
         return command_run_once(ctx)
+    if args.command == "run-until-idle":
+        return command_run_until_idle(ctx, args.max_steps)
     if args.command == "reassign":
         return command_reassign(ctx, args.reason)
     if args.command == "handoff":
