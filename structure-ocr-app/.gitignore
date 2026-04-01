@@ -1,0 +1,27 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.venv/
+.venv*/
+venv/
+
+# Node
+node_modules/
+dist/
+
+# Local env
+.env
+.env.*
+
+# make start/stop pid + logs
+.run/
+
+# Automation runtime output
+automation/outbox/current-task.md
+automation/handoffs/*.md
+automation/inbox/**/*.md
+automation/results/**/*.json

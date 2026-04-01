@@ -1,0 +1,39 @@
+primary_control_plane: opencode
+primary_implementation: cursor
+secondary_implementation: opencode
+tertiary_review: codex
+
+workload_share:
+  cursor: 80
+  codex: 3
+  opencode: 17
+
+routing:
+  planning: opencode
+  orchestration: opencode
+  implementation: cursor
+  repair_loop: cursor
+  ui_patch: cursor
+  narrow_review: codex
+  architecture_review: codex
+
+fallback_on_quota_exhausted:
+  cursor: opencode
+  opencode: codex
+  codex: opencode
+
+fallback_on_timeout:
+  cursor: opencode
+  opencode: codex
+  codex: opencode
+
+switch_rules:
+  require_handoff: true
+  one_active_implementation_owner_per_slice: true
+  preserve_slice_scope_on_reassignment: true
+
+operator_intent:
+  no_interruption_expected: true
+  overnight_run: true
+  desired_outcome: "a working end-to-end Phase 1 product by morning, with progress documented if blocked"
+
