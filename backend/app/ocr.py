@@ -42,9 +42,22 @@ class DocumentExtractor:
 
     def extract(self, raw: bytes, filename: str, suffix: str, mime_type: str) -> dict:
         notes: list[str] = []
+        if suffix == ".txt" or mime_type == "text/plain":
+            return self._extract_text(raw, notes)
         if suffix == ".pdf" or mime_type == "application/pdf":
             return self._extract_pdf(raw, notes)
         return self._extract_image(raw, notes)
+
+    def _extract_text(self, raw: bytes, notes: list[str]) -> dict:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("gbk")
+            except UnicodeDecodeError:
+                notes.append("Could not decode text file; returning raw bytes as text.")
+                text = raw.decode("utf-8", errors="replace")
+        return {"pages": 1, "text": text, "blocks": [{"page": 1, "type": "text", "text": text}], "notes": notes}
 
     def _extract_image(self, raw: bytes, notes: list[str]) -> dict:
         try:

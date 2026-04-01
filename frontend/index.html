@@ -3,11 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PaddleOCR Web App</title>
+    <title>Structure-OCR</title>
+    <style>
+      :root {
+        --bg-dark: #0f1419;
+        --bg-panel: #1c2128;
+        --bg-hover: #262c36;
+        --border: #30363d;
+        --text-primary: #e6edf3;
+        --text-secondary: #8b949e;
+        --accent-primary: #6366f1;
+        --accent-hover: #818cf8;
+        --accent-warm: #f59e0b;
+        --success: #22c55e;
+        --error: #ef4444;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        background: var(--bg-dark);
+        color: var(--text-primary);
+        height: 100vh;
+        overflow: hidden;
+      }
+      #root { height: 100vh; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
-  </html>
-
+</html>
