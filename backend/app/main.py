@@ -28,6 +28,21 @@ class PageBlock(BaseModel):
     text: str
     bbox: list[float] | None = None
     confidence: float | None = None
+    structure_type: str | None = None
+    reading_order: int | None = None
+    hierarchy_level: int | None = None
+    parent_id: str | None = None
+    relations: list[str] | None = None
+    group_id: str | None = None
+    table_html: str | None = None
+
+
+class PageInfo(BaseModel):
+    page: int
+    width: float | None = None
+    height: float | None = None
+    columns: int | None = None
+    layout_type: str | None = None
 
 
 class ExtractResponse(BaseModel):
@@ -38,6 +53,7 @@ class ExtractResponse(BaseModel):
     text: str
     blocks: list[PageBlock]
     notes: list[str]
+    page_infos: list[PageInfo] = []
 
 
 @app.get("/health")
@@ -76,4 +92,5 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
         text=result["text"],
         blocks=[PageBlock(**block) for block in result["blocks"]],
         notes=result["notes"],
+        page_infos=[PageInfo(**info) for info in result.get("page_infos", [])],
     )
