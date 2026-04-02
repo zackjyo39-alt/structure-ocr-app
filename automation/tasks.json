@@ -12,7 +12,7 @@
       "verification": [
         "npm run build"
       ],
-      "status": "queued"
+      "status": "done"
     },
     {
       "id": "phase1-backend-integration",
@@ -28,7 +28,7 @@
         "PYTHONPATH=backend .venv311/bin/pytest backend/tests -q",
         "npm run build"
       ],
-      "status": "queued"
+      "status": "done"
     },
     {
       "id": "phase1-smoke-runbook",
@@ -41,7 +41,7 @@
       "verification": [
         "manual doc review"
       ],
-      "status": "queued"
+      "status": "done"
     }
   ]
 }
