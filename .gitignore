@@ -25,3 +25,6 @@ automation/outbox/current-task.md
 automation/handoffs/*.md
 automation/inbox/**/*.md
 automation/results/**/*.json
+
+# VLM runtime config (may contain API keys)
+backend/app/vlm_config.json
