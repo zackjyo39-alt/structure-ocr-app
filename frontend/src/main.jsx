@@ -376,36 +376,27 @@ function StructureView({ blocks, pageInfos, highlightedBlockIndex, setHighlighte
   );
 }
 
-function Sidebar({ activeView, setActiveView }) {
+function Sidebar({ activeView, setActiveView, onNewExtraction }) {
   const items = [
-    { id: "workspace", label: "Workspace", icon: "◈" },
+    { id: "workspace", label: "Extraction", icon: "✦" },
+    { id: "config", label: "VLM Config", icon: "⚙" },
     { id: "history", label: "History", icon: "◷" },
-    { id: "templates", label: "Templates", icon: "◰" },
-    { id: "apikeys", label: "API Keys", icon: "⚷" },
     { id: "help", label: "Help", icon: "?" },
-    { id: "logout", label: "Logout", icon: "⏻" },
   ];
   return (
     <aside style={{
-      width: 220, background: "#161b22", borderRight: "1px solid #30363d",
+      width: 200, background: "#161b22", borderRight: "1px solid #30363d",
       display: "flex", flexDirection: "column", padding: "16px 0"
     }}>
-      <div style={{ padding: "0 16px 24px", borderBottom: "1px solid #30363d", marginBottom: 16 }}>
-        <h1 style={{ fontSize: 18, fontWeight: 700, color: "#e6edf3" }}>Structure-OCR</h1>
-        <span style={{ fontSize: 11, color: "#8b949e", display: "block", marginTop: 4 }}>Phase 1 Demo</span>
+      <div style={{ padding: "0 16px 20px", borderBottom: "1px solid #30363d", marginBottom: 12 }}>
+        <h1 style={{ fontSize: 16, fontWeight: 700, color: "#e6edf3" }}>Structure-OCR</h1>
+        <span style={{ fontSize: 11, color: "#8b949e", display: "block", marginTop: 2 }}>Phase 1 Demo</span>
       </div>
-      <button onClick={() => setActiveView("workspace")} style={{
-        background: activeView === "workspace" ? "#262c36" : "transparent",
-        color: activeView === "workspace" ? "#e6edf3" : "#8b949e",
-        border: "none", padding: "10px 16px", cursor: "pointer", textAlign: "left",
-        fontSize: 14, display: "flex", alignItems: "center", gap: 10, width: "100%"
-      }}>
-        <span>✦</span> New Extraction
-      </button>
-      <nav style={{ marginTop: 8 }}>
+      <nav>
         {items.map(item => (
           <button key={item.id} onClick={() => setActiveView(item.id)} style={{
-            background: "transparent", color: "#8b949e", border: "none",
+            background: activeView === item.id ? "#262c36" : "transparent",
+            color: activeView === item.id ? "#e6edf3" : "#8b949e", border: "none",
             padding: "10px 16px", cursor: "pointer", textAlign: "left",
             fontSize: 13, display: "flex", alignItems: "center", gap: 10, width: "100%"
           }}>
@@ -417,22 +408,397 @@ function Sidebar({ activeView, setActiveView }) {
   );
 }
 
-function Header() {
+function Header({ activeView }) {
   return (
     <header style={{
-      height: 56, background: "#161b22", borderBottom: "1px solid #30363d",
+      height: 48, background: "#161b22", borderBottom: "1px solid #30363d",
       display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 24px"
     }}>
-      <div style={{ display: "flex", gap: 24, fontSize: 13 }}>
-        <a href="#" style={{ color: "#8b949e", textDecoration: "none" }}>Backend Config</a>
-        <a href="#" style={{ color: "#8b949e", textDecoration: "none" }}>Status</a>
-        <a href="#" style={{ color: "#8b949e", textDecoration: "none" }}>Documentation</a>
-      </div>
+      <span style={{ fontSize: 13, color: "#8b949e", textTransform: "capitalize" }}>
+        {activeView === "workspace" ? "Extraction Workspace" : activeView === "config" ? "VLM Config" : activeView}
+      </span>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <button style={{ background: "transparent", border: "none", color: "#8b949e", cursor: "pointer", fontSize: 18 }}>⚙</button>
-        <div style={{ width: 32, height: 32, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600 }}>U</div>
+        <div style={{ width: 30, height: 30, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, color: "#fff" }}>U</div>
       </div>
     </header>
+  );
+}
+
+function ConfigPanel({ vlmConfig, setVlmConfig }) {
+  const [form, setForm] = useState({
+    enabled: false,
+    provider: "ollama",
+    model: "",
+    base_url: "",
+    api_key: "",
+  });
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const [ollamaStatus, setOllamaStatus] = useState(null); // null | "checking" | "running" | "stopped"
+  const [ollamaModels, setOllamaModels] = useState([]);
+
+  const checkOllama = useCallback(async (baseUrl) => {
+    setOllamaStatus("checking");
+    try {
+      const url = `${API_BASE}/api/health/ollama?base_url=${encodeURIComponent(baseUrl || "http://localhost:11434/api/chat")}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      setOllamaStatus(data.running ? "running" : "stopped");
+      setOllamaModels(data.models || []);
+    } catch {
+      setOllamaStatus("stopped");
+      setOllamaModels([]);
+    }
+  }, []);
+
+  // Auto-check Ollama when provider is ollama
+  useEffect(() => {
+    if (form.provider === "ollama") {
+      checkOllama(form.base_url);
+    } else {
+      setOllamaStatus(null);
+    }
+  }, [form.provider, checkOllama]);
+
+  const presets = useMemo(() => vlmConfig?.presets || {}, [vlmConfig]);
+  const presetEntries = useMemo(() => Object.entries(presets), [presets]);
+
+  useEffect(() => {
+    if (!vlmConfig) return;
+    setForm({
+      enabled: !!vlmConfig.enabled,
+      provider: vlmConfig.provider || "ollama",
+      model: vlmConfig.model || "",
+      base_url: vlmConfig.base_url || "",
+      api_key: vlmConfig.api_key || "",
+    });
+  }, [vlmConfig]);
+
+  const loadConfig = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const res = await fetch(`${API_BASE}/api/vlm-config`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      }
+      const data = await res.json();
+      setVlmConfig(data);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [setVlmConfig]);
+
+  useEffect(() => {
+    loadConfig();
+  }, [loadConfig]);
+
+  const updateField = (key, value) => {
+    setForm((current) => ({ ...current, [key]: value }));
+    setStatus("");
+  };
+
+  const handlePresetChange = (presetId) => {
+    if (!presetId) return;
+    if (presetId === "__local_deepseek__") {
+      setForm((current) => ({
+        ...current,
+        provider: "ollama",
+        model: "deepseek-ocr:3b",
+        base_url: "http://localhost:11434/api/chat",
+      }));
+      setStatus("已载入预设：Ollama · deepseek-ocr:3b");
+      return;
+    }
+    const preset = presets[presetId];
+    if (!preset) return;
+    setForm((current) => ({
+      ...current,
+      provider: preset.provider || current.provider,
+      model: preset.model || "",
+      base_url: preset.base_url || "",
+      api_key: preset.api_key || current.api_key,
+    }));
+    setStatus(`已载入预设：${preset.label}`);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError("");
+    setStatus("");
+    try {
+      const payload = {
+        enabled: !!form.enabled,
+        provider: form.provider.trim(),
+        model: form.model.trim(),
+        base_url: form.base_url.trim(),
+        api_key: form.api_key,
+      };
+      const res = await fetch(`${API_BASE}/api/vlm-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      }
+      const data = await res.json();
+      setVlmConfig({ ...vlmConfig, ...data, presets });
+      setStatus("配置已保存，下一次抽取会直接使用最新 VLM 配置。");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cardStyle = {
+    background: "#161b22",
+    border: "1px solid #30363d",
+    borderRadius: 12,
+    padding: 20,
+  };
+
+  return (
+    <div style={{ flex: 1, overflow: "auto", padding: 24, background: "#0d1117" }}>
+      <div style={{ maxWidth: 920, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16 }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 700, color: "#e6edf3", marginBottom: 8 }}>Backend Config</div>
+          <div style={{ fontSize: 14, color: "#8b949e", lineHeight: 1.6 }}>
+            这里可以切换结构化 OCR 的底层引擎。保存后无需重启后端，下一次调用 `/api/extract` 会直接采用最新配置。
+          </div>
+        </div>
+
+        <div style={cardStyle}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: 16, color: "#e6edf3", fontWeight: 600, marginBottom: 6 }}>VLM 模式</div>
+              <div style={{ fontSize: 13, color: "#8b949e", maxWidth: 560 }}>
+                关闭时走旧的几何 PaddleOCR 路线；开启后，后端会优先使用你当前保存的多模态模型配置。
+              </div>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, color: "#e6edf3", fontSize: 14 }}>
+              <input
+                type="checkbox"
+                checked={!!form.enabled}
+                onChange={(e) => updateField("enabled", e.target.checked)}
+                style={{ width: 18, height: 18 }}
+              />
+              启用 VLM
+            </label>
+          </div>
+        </div>
+
+        <div style={cardStyle}>
+          <div style={{ fontSize: 16, color: "#e6edf3", fontWeight: 600, marginBottom: 6 }}>模型预设</div>
+          <div style={{ fontSize: 13, color: "#8b949e", marginBottom: 14 }}>
+            可以先选预设，再按需继续编辑 Provider、Model、Base URL 和 API Key。
+          </div>
+          <select
+            defaultValue=""
+            onChange={(e) => handlePresetChange(e.target.value)}
+            style={{
+              width: "100%",
+              background: "#0d1117",
+              color: "#e6edf3",
+              border: "1px solid #30363d",
+              borderRadius: 8,
+              padding: "12px 14px",
+              fontSize: 14,
+            }}
+          >
+            <option value="" disabled>选择一个推荐预设</option>
+            {presetEntries.map(([id, preset]) => {
+              let label = preset.label;
+              if (id === "nim-paddleocr-vl") label += " · 推荐：轻量化实时应用";
+              if (id === "nim-deepseek-ocr") label += " · 推荐：高质量知识库 RAG 压缩";
+              if (id === "ollama-deepseek-ocr") label += " · 推荐：完全本地隐私方案";
+              return (
+                <option key={id} value={id}>{label}</option>
+              );
+            })}
+            {!presets["ollama-deepseek-ocr"] && (
+              <option value="__local_deepseek__">Ollama · deepseek-ocr:3b · 推荐：完全本地隐私方案</option>
+            )}
+          </select>
+          {!presets["ollama-deepseek-ocr"] && (
+            <button
+              onClick={() => setForm((current) => ({
+                ...current,
+                provider: "ollama",
+                model: "deepseek-ocr:3b",
+                base_url: "http://localhost:11434/api/chat",
+              }))}
+              style={{
+                marginTop: 12,
+                background: "transparent",
+                color: "#7dd3fc",
+                border: "1px solid #164e63",
+                borderRadius: 8,
+                padding: "8px 12px",
+                cursor: "pointer",
+                fontSize: 13,
+              }}
+            >
+              一键填入 Ollama · deepseek-ocr:3b
+            </button>
+          )}
+        </div>
+
+        <div style={cardStyle}>
+          <div style={{ fontSize: 16, color: "#e6edf3", fontWeight: 600, marginBottom: 14 }}>连接参数</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: 12, color: "#8b949e" }}>Provider</span>
+              <input
+                value={form.provider}
+                onChange={(e) => updateField("provider", e.target.value)}
+                placeholder="ollama / openai / gemini"
+                style={{
+                  background: "#0d1117",
+                  color: "#e6edf3",
+                  border: "1px solid #30363d",
+                  borderRadius: 8,
+                  padding: "12px 14px",
+                  fontSize: 14,
+                }}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: 12, color: "#8b949e" }}>
+                Base URL
+                {form.provider === "gemini" && (
+                  <span style={{ marginLeft: 8, color: "#34d399", fontSize: 11 }}>● Auto-managed</span>
+                )}
+              </span>
+              <input
+                value={form.base_url}
+                onChange={(e) => updateField("base_url", e.target.value)}
+                placeholder={
+                  form.provider === "gemini"
+                    ? "Auto: https://generativelanguage.googleapis.com/v1beta"
+                    : "http://localhost:11434/api/chat"
+                }
+                readOnly={form.provider === "gemini"}
+                style={{
+                  background: form.provider === "gemini" ? "#161b22" : "#0d1117",
+                  color: form.provider === "gemini" ? "#34d399" : "#e6edf3",
+                  border: form.provider === "gemini" ? "1px solid rgba(52,211,153,0.3)" : "1px solid #30363d",
+                  borderRadius: 8,
+                  padding: "12px 14px",
+                  fontSize: 14,
+                  cursor: form.provider === "gemini" ? "default" : "text",
+                }}
+              />
+              {form.provider === "gemini" && (
+                <span style={{ fontSize: 11, color: "#6b7280" }}>
+                  Gemini 会自动构造完整 URL，无需手动修改
+                </span>
+              )}
+            </label>
+            {/* Model field: dropdown from Ollama when available, else free text */}
+            <label style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: 12, color: "#8b949e" }}>
+                Model
+                {form.provider === "ollama" && ollamaStatus === "running" && ollamaModels.length > 0 && (
+                  <span style={{ marginLeft: 8, color: "#34d399", fontSize: 11 }}>● {ollamaModels.length} 个可用模型</span>
+                )}
+              </span>
+              {form.provider === "ollama" && ollamaStatus === "running" && ollamaModels.length > 0 ? (
+                <select
+                  value={form.model}
+                  onChange={(e) => updateField("model", e.target.value)}
+                  style={{
+                    background: "#0d1117", color: "#e6edf3",
+                    border: "1px solid #34d399", borderRadius: 8,
+                    padding: "12px 14px", fontSize: 14,
+                  }}
+                >
+                  <option value="">-- 选择已安装的模型 --</option>
+                  {ollamaModels.map(m => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  value={form.model}
+                  onChange={(e) => updateField("model", e.target.value)}
+                  placeholder={
+                    form.provider === "ollama" ? "llava / llama3.2-vision (需先 ollama pull)"
+                    : form.provider === "gemini" ? "gemini-2.5-flash"
+                    : form.provider === "openai" ? "gpt-4o-mini"
+                    : "meta/llama-3.2-11b-vision-instruct"
+                  }
+                  style={{
+                    background: "#0d1117", color: "#e6edf3",
+                    border: "1px solid #30363d", borderRadius: 8,
+                    padding: "12px 14px", fontSize: 14,
+                  }}
+                />
+              )}
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 8, gridColumn: "1 / -1" }}>
+              <span style={{ fontSize: 12, color: "#8b949e" }}>API Key</span>
+              <input
+                type="password"
+                value={form.api_key}
+                onChange={(e) => updateField("api_key", e.target.value)}
+                placeholder="填写 NVIDIA / OpenAI / Gemini 等提供商密钥"
+                style={{
+                  background: "#0d1117",
+                  color: "#e6edf3",
+                  border: "1px solid #30363d",
+                  borderRadius: 8,
+                  padding: "12px 14px",
+                  fontSize: 14,
+                }}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={handleSave}
+            disabled={saving || loading}
+            style={{
+              padding: "12px 18px",
+              background: "#6366f1",
+              color: "#fff",
+              border: "none",
+              borderRadius: 8,
+              cursor: saving || loading ? "not-allowed" : "pointer",
+              fontSize: 14,
+              fontWeight: 600,
+            }}
+          >
+            {saving ? "保存中..." : "保存配置"}
+          </button>
+          <button
+            onClick={loadConfig}
+            disabled={saving || loading}
+            style={{
+              padding: "12px 18px",
+              background: "transparent",
+              color: "#8b949e",
+              border: "1px solid #30363d",
+              borderRadius: 8,
+              cursor: saving || loading ? "not-allowed" : "pointer",
+              fontSize: 14,
+            }}
+          >
+            {loading ? "刷新中..." : "从后端重新读取"}
+          </button>
+          {status && <span style={{ fontSize: 13, color: "#34d399" }}>{status}</span>}
+          {error && <span style={{ fontSize: 13, color: "#f87171" }}>{error}</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -497,6 +863,7 @@ function UploadCanvas({
   setPointerMeta,
   fullText,
   blockSpans,
+  onClearSession,
 }) {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
@@ -647,7 +1014,25 @@ function UploadCanvas({
     <div style={{
       flex: 1, display: "flex", flexDirection: "column", background: "#0d1117", padding: 24
     }}>
-      <div style={{ marginBottom: 8, fontSize: 13, color: "#8b949e" }}>Source Document</div>
+      <div style={{ marginBottom: 8, fontSize: 13, color: "#8b949e", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span>Source Document</span>
+        {file && (
+          <button
+            onClick={onClearSession}
+            title="Clear session and start over"
+            style={{
+              background: "transparent", border: "1px solid #30363d", borderRadius: 6,
+              color: "#8b949e", cursor: "pointer", fontSize: 12, padding: "3px 10px",
+              display: "flex", alignItems: "center", gap: 4,
+              transition: "color 0.15s, border-color 0.15s",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.color = "#ef4444"; e.currentTarget.style.borderColor = "#ef4444"; }}
+            onMouseLeave={e => { e.currentTarget.style.color = "#8b949e"; e.currentTarget.style.borderColor = "#30363d"; }}
+          >
+            × Start Over
+          </button>
+        )}
+      </div>
       <div
         onDrop={handleDrop}
         onDragOver={handleDragOver}
@@ -737,11 +1122,102 @@ function UploadCanvas({
   );
 }
 
+function ProgressPanel({ progress, events }) {
+  const stageLabels = {
+    upload_received: "📥 File received",
+    model_loading: "⏳ Loading OCR models",
+    page_start: "📄 Processing page",
+    page_native_text: "📝 Extracting native text",
+    page_ocr_done: "✅ OCR hints extracted",
+    page_vlm_start: "🧠 VLM analyzing",
+    page_vlm_done: "✅ VLM analysis complete",
+    ocr_fallback: "🔄 Falling back to OCR",
+    structure_fallback: "📐 Running layout analysis",
+    complete: "🎉 Extraction complete",
+    error: "❌ Processing error",
+  };
+
+  const pct = Math.round((progress || 0) * 100);
+  const lastEvents = events.slice(-8);
+  const hasPages = events.some(e => e.page != null && e.total_pages != null);
+  const currentPage = events.findLast(e => e.page != null)?.page;
+  const totalPages = events.findLast(e => e.total_pages != null)?.total_pages;
+  const currentEngine = events.findLast(e => e.engine != null)?.engine;
+
+  const engineLabel = {
+    vlm: "VLM",
+    ocr: "PaddleOCR",
+    structure: "PPStructure",
+    native_text: "Native PDF text",
+  };
+
+  return (
+    <div style={{
+      flex: 1, overflow: "auto", background: "#161b22", borderRadius: 8, padding: 20,
+      display: "flex", flexDirection: "column", gap: 16,
+    }}>
+      <div style={{ fontSize: 13, color: "#8b949e" }}>Processing document…</div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#8b949e" }}>
+          <span>{stageLabels[events[events.length - 1]?.stage] || events[events.length - 1]?.stage || "Starting…"}</span>
+          <span>{pct}%</span>
+        </div>
+        <div style={{
+          width: "100%", height: 6, background: "#262c36", borderRadius: 3, overflow: "hidden",
+        }}>
+          <div style={{
+            width: `${pct}%`, height: "100%", borderRadius: 3,
+            background: pct >= 100 ? "#34d399" : "#6366f1",
+            transition: "width 0.3s ease, background 0.3s",
+          }} />
+        </div>
+      </div>
+
+      {hasPages && currentPage != null && (
+        <div style={{
+          display: "flex", gap: 12, fontSize: 12, color: "#6b7280", flexWrap: "wrap",
+        }}>
+          <span>Page {currentPage} / {totalPages}</span>
+          {currentEngine && <span>Engine: {engineLabel[currentEngine] || currentEngine}</span>}
+        </div>
+      )}
+
+      <div style={{
+        background: "#1c2128", borderRadius: 6, padding: 10, maxHeight: 240, overflow: "auto",
+        fontSize: 11, lineHeight: 1.6,
+      }}>
+        {lastEvents.map((evt, i) => {
+          const isError = evt.stage === "error";
+          const isComplete = evt.stage === "complete";
+          return (
+            <div key={i} style={{
+              color: isError ? "#f87171" : isComplete ? "#34d399" : "#8b949e",
+              paddingLeft: evt.page != null ? 8 : 0,
+              borderLeft: evt.page != null ? "2px solid #30363d" : "none",
+            }}>
+              {evt.message}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ResultPanel({
   result,
   loading,
+  progress,
+  progressEvents,
   error,
   onExport,
+  onExportMarkdown,
+  summary,
+  summaryLoading,
+  summaryError,
+  onSummarize,
+  vlmEnabled,
   highlightedBlockIndex,
   setHighlightedBlockIndex,
   activeTab,
@@ -751,10 +1227,11 @@ function ResultPanel({
   rawPreRef,
 }) {
   const tabs = [
-    { id: "layout", label: "Layout View" },
-    { id: "structure", label: "Structure View" },
+    { id: "layout", label: "Layout" },
+    { id: "structure", label: "Structure" },
     { id: "raw", label: "Raw Text" },
-    { id: "table", label: "Table/Excel" },
+    { id: "table", label: "Table" },
+    { id: "summary", label: "🤖 AI Summary" },
   ];
 
   const groupedBlocks = useMemo(() => {
@@ -821,8 +1298,56 @@ function ResultPanel({
       </div>
 
       <div style={{ flex: 1, overflow: "auto", background: "#161b22", borderRadius: 8, padding: 16 }}>
-        {loading && <div style={{ color: "#8b949e", textAlign: "center", padding: 40 }}>Processing document...</div>}
+        {loading && progress && (
+          <ProgressPanel progress={progress} events={progressEvents} />
+        )}
+        {loading && !progress && <div style={{ color: "#8b949e", textAlign: "center", padding: 40 }}>Processing document...</div>}
         {error && <div style={{ color: "#ef4444", padding: 16 }}>Error: {error}</div>}
+        {result?.notes?.length > 0 && (() => {
+          const errorKeywords = ["失败", "异常"];
+          const warningKeywords = ["差异", "遗漏", "过度分割", "过大", "建议复核"];
+          const categorized = { errors: [], warnings: [], infos: [] };
+          result.notes.forEach(note => {
+            if (errorKeywords.some(k => note.includes(k))) {
+              categorized.errors.push(note);
+            } else if (warningKeywords.some(k => note.includes(k))) {
+              categorized.warnings.push(note);
+            } else {
+              categorized.infos.push(note);
+            }
+          });
+          return (
+            <>
+              {categorized.errors.length > 0 && (
+                <div style={{
+                  background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.3)",
+                  borderRadius: 8, padding: "10px 14px", marginBottom: 8, fontSize: 13, color: "#f87171",
+                  lineHeight: 1.6,
+                }}>
+                  ❌ {categorized.errors.map((note, i) => <div key={i}>{note}</div>)}
+                </div>
+              )}
+              {categorized.warnings.length > 0 && (
+                <div style={{
+                  background: "rgba(245, 158, 11, 0.1)", border: "1px solid rgba(245, 158, 11, 0.3)",
+                  borderRadius: 8, padding: "10px 14px", marginBottom: 8, fontSize: 13, color: "#fbbf24",
+                  lineHeight: 1.6,
+                }}>
+                  ⚠️ {categorized.warnings.map((note, i) => <div key={i}>{note}</div>)}
+                </div>
+              )}
+              {categorized.infos.length > 0 && (
+                <div style={{
+                  background: "rgba(99, 102, 241, 0.1)", border: "1px solid rgba(99, 102, 241, 0.3)",
+                  borderRadius: 8, padding: "10px 14px", marginBottom: 8, fontSize: 13, color: "#a5b4fc",
+                  lineHeight: 1.6,
+                }}>
+                  ℹ️ {categorized.infos.map((note, i) => <div key={i}>{note}</div>)}
+                </div>
+              )}
+            </>
+          );
+        })()}
         {!result && !loading && !error && <div style={{ color: "#8b949e", textAlign: "center", padding: 40 }}>Upload a document and click Process to begin</div>}
 
         {result && activeTab === "layout" && (
@@ -950,6 +1475,138 @@ function ResultPanel({
           </pre>
         )}
 
+        {result && activeTab === "summary" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {/* Engine badge */}
+            {result.vlm_used != null && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20,
+                  background: result.vlm_used ? "rgba(52,211,153,0.15)" : "rgba(99,102,241,0.15)",
+                  color: result.vlm_used ? "#34d399" : "#a5b4fc",
+                  border: `1px solid ${result.vlm_used ? "rgba(52,211,153,0.35)" : "rgba(99,102,241,0.35)"}`,
+                }}>
+                  {result.vlm_used ? `✦ VLM · ${result.vlm_engine || "enabled"}` : "⊕ PaddleOCR (geometric fallback)"}
+                </span>
+                {!result.vlm_used && <span style={{ fontSize: 12, color: "#8b949e" }}>VLM 未启用或调用失败，当前为几何布局提取结果</span>}
+                {result.vlm_used && result.blocks?.length > 0 && (() => {
+                  const confs = result.blocks.filter(b => b.confidence != null).map(b => b.confidence);
+                  if (!confs.length) return null;
+                  const avg = confs.reduce((a, b) => a + b, 0) / confs.length;
+                  const low = confs.filter(c => c < 0.7).length;
+                  const color = avg >= 0.9 ? "#34d399" : avg >= 0.8 ? "#fbbf24" : "#f87171";
+                  return (
+                    <span style={{ fontSize: 11, color: "#8b949e" }}>
+                      置信度: <strong style={{ color }}>{(avg * 100).toFixed(1)}%</strong>
+                      {low > 0 && <span style={{ color: "#f87171", marginLeft: 6 }}>({low} 块低于 70%，建议复核)</span>}
+                    </span>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Extracted raw text from the document */}
+            {result.text && (
+              <div>
+                <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>📄 提取文本</div>
+                <pre style={{
+                  background: "#1c2128", borderRadius: 8, padding: 14, fontSize: 13,
+                  color: "#e6edf3", whiteSpace: "pre-wrap", wordBreak: "break-word",
+                  lineHeight: 1.7, maxHeight: 260, overflow: "auto",
+                  border: "1px solid #30363d",
+                }}>{result.text}</pre>
+              </div>
+            )}
+
+            {/* Block type breakdown */}
+            {result.blocks?.length > 0 && (() => {
+              const counts = {};
+              result.blocks.forEach(b => { counts[b.type] = (counts[b.type] || 0) + 1; });
+              return (
+                <div>
+                  <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>🗂 结构概览</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {Object.entries(counts).map(([type, n]) => (
+                      <span key={type} style={{ background: "#262c36", color: "#e6edf3", borderRadius: 6, padding: "4px 12px", fontSize: 12 }}>
+                        {type}: <strong>{n}</strong>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* AI Summary section */}
+            <div style={{ borderTop: "1px solid #30363d", paddingTop: 14 }}>
+              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>🤖 AI 摘要</div>
+              {!vlmEnabled && (
+                <div style={{ background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 8, padding: 14, fontSize: 13, color: "#a5b4fc" }}>
+                  💡 启用 VLM 后才能生成 AI 摘要。请前往 <strong>VLM Config</strong> 配置并启用。
+                </div>
+              )}
+              {vlmEnabled && !summary && !summaryLoading && !summaryError && (
+                <div style={{ textAlign: "center", padding: "24px 0" }}>
+                  <div style={{ fontSize: 13, color: "#8b949e", marginBottom: 14 }}>让 VLM 对整个文档进行语义理解和摘要生成。</div>
+                  <button
+                    onClick={onSummarize}
+                    style={{ padding: "10px 24px", background: "#6366f1", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}
+                  >
+                    ✨ 生成摘要
+                  </button>
+                </div>
+              )}
+              {summaryLoading && (
+                <div style={{ textAlign: "center", padding: 20, color: "#8b949e", fontSize: 14 }}>VLM 分析中，请稍候…</div>
+              )}
+              {summaryError && (
+                <div style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: 8, padding: 14, fontSize: 13, color: "#f87171" }}>
+                  ⚠️ {summaryError}
+                </div>
+              )}
+              {summary && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {summary.court && (
+                      <span style={{ background: "rgba(99,102,241,0.2)", border: "1px solid rgba(99,102,241,0.4)", color: "#a5b4fc", borderRadius: 20, padding: "4px 14px", fontSize: 12, fontWeight: 600 }}>
+                        🏛️ {summary.court}
+                      </span>
+                    )}
+                    {summary.case_number && (
+                      <span style={{ background: "rgba(52,211,153,0.15)", border: "1px solid rgba(52,211,153,0.3)", color: "#34d399", borderRadius: 20, padding: "4px 14px", fontSize: 12, fontWeight: 600 }}>
+                        📄 {summary.case_number}
+                      </span>
+                    )}
+                    {summary.word_count_estimate > 0 && (
+                      <span style={{ background: "#262c36", color: "#8b949e", borderRadius: 20, padding: "4px 14px", fontSize: 12 }}>~{summary.word_count_estimate} words</span>
+                    )}
+                  </div>
+                  {summary.main_ruling && (
+                    <div style={{ background: "#1c2128", borderRadius: 8, padding: 16, fontSize: 14, color: "#e6edf3", lineHeight: 1.7, border: "1px solid #30363d" }}>
+                      <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8, fontWeight: 600 }}>核心判决 / 摘要事实</div>
+                      {summary.main_ruling}
+                    </div>
+                  )}
+                  {summary.plaintiff_defendant?.length > 0 && (
+                    <div>
+                      <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8 }}>涉案当事人</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                        {summary.plaintiff_defendant.map((p, i) => (
+                          <span key={i} style={{ background: "#262c36", color: "#e6edf3", borderRadius: 6, padding: "4px 12px", fontSize: 13 }}>👤 {p}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <button
+                    onClick={onSummarize}
+                    style={{ alignSelf: "flex-start", background: "transparent", border: "1px solid #30363d", borderRadius: 6, color: "#8b949e", cursor: "pointer", fontSize: 12, padding: "6px 14px" }}
+                  >
+                    🔄 重新生成
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {result && activeTab === "table" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             {(() => {
@@ -1007,6 +1664,11 @@ function ResultPanel({
             }}>
               Export JSON
             </button>
+            <button onClick={onExportMarkdown} style={{
+              padding: "8px 16px", background: "transparent", color: "#e6edf3", border: "1px solid #30363d", borderRadius: 6, cursor: "pointer", fontSize: 13
+            }}>
+              Export Markdown
+            </button>
           </div>
           <div style={{ padding: 8, background: "#161b22", borderRadius: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             <span style={{ fontSize: 11, color: "#6b7280" }}>Structure:</span>
@@ -1025,14 +1687,20 @@ function ResultPanel({
 
 function App() {
   const [activeView, setActiveView] = useState("workspace");
+  const [vlmConfig, setVlmConfig] = useState(null);
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState(null);
   const [txtContent, setTxtContent] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [progressEvents, setProgressEvents] = useState([]);
   const [highlightedBlockIndex, setHighlightedBlockIndex] = useState(null);
   const [pointerMeta, setPointerMeta] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [summaryError, setSummaryError] = useState("");
   const [activeTab, setActiveTab] = useState("layout");
   const rawPreRef = useRef(null);
 
@@ -1045,15 +1713,51 @@ function App() {
     if (!file) return;
     setLoading(true);
     setError("");
+    setProgress(0);
+    setProgressEvents([]);
+    setResult(null);
+
     const formData = new FormData();
     formData.append("file", file);
+
     try {
-      const res = await fetch(`${API_BASE}/api/extract`, { method: "POST", body: formData });
+      const res = await fetch(`${API_BASE}/api/extract-stream`, { method: "POST", body: formData });
       if (!res.ok) {
         const errorText = await res.text();
         throw new Error(`HTTP ${res.status}: ${errorText}`);
       }
-      setResult(await res.json());
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith("data: ")) {
+            try {
+              const data = JSON.parse(lines[i].slice(6));
+              setProgress(data.progress || 0);
+              setProgressEvents(prev => [...prev, data]);
+
+              if (data.stage === "complete" && data.extra?.result) {
+                setResult(data.extra.result);
+              }
+              if (data.stage === "error") {
+                throw new Error(data.message);
+              }
+            } catch (parseErr) {
+              if (parseErr.message && !parseErr.message.startsWith("HTTP")) throw parseErr;
+            }
+          }
+        }
+      }
     } catch (err) {
       const errorMessage = err.message || String(err);
       if (errorMessage.includes("Failed to fetch") || err instanceof TypeError) {
@@ -1078,6 +1782,108 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportMarkdown = () => {
+    if (!result) return;
+    const lines = [];
+    lines.push(`# ${(file?.name || "Document").replace(/\.[^.]+$/, "")}\n`);
+    const grouped = {};
+    result.blocks.forEach(block => {
+      const page = block.page || 1;
+      if (!grouped[page]) grouped[page] = [];
+      grouped[page].push(block);
+    });
+    const pageKeys = Object.keys(grouped);
+    pageKeys.forEach(page => {
+      if (pageKeys.length > 1) {
+        lines.push(`\n---\n\n## Page ${page}\n`);
+      }
+      grouped[page].forEach(block => {
+        const stype = block.structure_type || block.type;
+        const text = (block.text || "").trim();
+        if (!text && !block.table_html) return;
+        if (stype === "title" || stype === "doc_title" || stype === "paragraph_title") {
+          const hlevel = block.hierarchy_level;
+          const md_level = hlevel <= 0 ? 2 : hlevel <= 1 ? 3 : 4;
+          lines.push(`${"#".repeat(md_level)} ${text}\n`);
+        } else if (stype === "table" && block.table_html) {
+          lines.push(`\n${block.table_html}\n`);
+        } else if (stype === "caption" || stype === "figure_caption" || stype === "table_caption") {
+          lines.push(`> *${text}*\n`);
+        } else if (stype === "equation" || stype === "formula") {
+          lines.push(`\n$$\n${text}\n$$\n`);
+        } else if (stype === "list") {
+          text.split("\n").forEach(item => {
+            const trimmed = item.trim();
+            if (trimmed) lines.push(`- ${trimmed}`);
+          });
+          lines.push("");
+        } else if (stype === "header") {
+          // skip page headers from output
+        } else if (stype === "footer") {
+          // skip page footers from output
+        } else if (stype === "footnote") {
+          lines.push(`[^]: ${text}\n`);
+        } else {
+          lines.push(`${text}\n`);
+        }
+      });
+    });
+    if (result.notes?.length) {
+      lines.push(`\n---\n\n> **Processing Notes:** ${result.notes.join(" | ")}\n`);
+    }
+    const md = lines.join("\n");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(file?.name || "extraction").replace(/\.[^.]+$/, "")}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Just navigate to workspace — state (file, result) is preserved so the
+  // user can switch between Config / History / etc. and come back without
+  // losing their work. Explicit reset is via the "× Start Over" button.
+  const handleNewExtraction = () => {
+    setActiveView("workspace");
+  };
+
+  const handleSummarize = async () => {
+    if (!file) return;
+    setSummaryLoading(true);
+    setSummaryError("");
+    setSummary(null);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch(`${API_BASE}/api/summarize`, { method: "POST", body: formData });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      setSummary(await res.json());
+    } catch (err) {
+      setSummaryError(err.message || String(err));
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const handleClearSession = () => {
+    setFile(null);
+    setPreview(null);
+    setTxtContent("");
+    setResult(null);
+    setError("");
+    setProgress(0);
+    setProgressEvents([]);
+    setHighlightedBlockIndex(null);
+    setPointerMeta(null);
+    setActiveTab("layout");
+    setSummary(null);
+    setSummaryError("");
+  };
+
   const avgConfidence = useMemo(() => {
     if (!result?.blocks?.length) return 0;
     const withConf = result.blocks.filter(b => b.confidence != null);
@@ -1098,38 +1904,83 @@ function App() {
     return parts.join(" · ");
   }, [pointerMeta]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadVlmConfig = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/vlm-config`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setVlmConfig(data);
+      } catch {
+        // Keep the workspace usable even if the config endpoint is temporarily unavailable.
+      }
+    };
+
+    loadVlmConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const engineLabel = useMemo(() => {
+    if (!vlmConfig) return result ? "PaddleOCR" : "Ready";
+    if (!vlmConfig.enabled) return "PaddleOCR (geometry)";
+    const provider = vlmConfig.provider || "vlm";
+    const model = vlmConfig.model || "custom";
+    return `VLM · ${provider} / ${model}`;
+  }, [result, vlmConfig]);
+
   return (
     <div style={{ display: "flex", height: "100vh", background: "#0f1419" }}>
-      <Sidebar activeView={activeView} setActiveView={setActiveView} />
+      <Sidebar activeView={activeView} setActiveView={setActiveView} onNewExtraction={handleNewExtraction} />
       <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-        <Header />
-        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
-          <UploadCanvas
-            file={file} setFile={setFile}
-            preview={preview} setPreview={setPreview}
-            blocks={result?.blocks}
-            highlightedBlockIndex={highlightedBlockIndex}
-            setHighlightedBlockIndex={setHighlightedBlockIndex}
-            txtContent={txtContent}
-            setTxtContent={setTxtContent}
-            setPointerMeta={setPointerMeta}
-            fullText={result?.text ?? ""}
-            blockSpans={blockSpans}
-          />
-          <ResultPanel
-            result={result}
-            loading={loading}
-            error={error}
-            onExport={handleExport}
-            highlightedBlockIndex={highlightedBlockIndex}
-            setHighlightedBlockIndex={setHighlightedBlockIndex}
-            activeTab={activeTab}
-            setActiveTab={setActiveTab}
-            blockSpans={blockSpans}
-            setPointerMeta={setPointerMeta}
-            rawPreRef={rawPreRef}
-          />
-        </div>
+        <Header activeView={activeView} />
+        {activeView === "workspace" ? (
+          <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+            <UploadCanvas
+              file={file} setFile={setFile}
+              preview={preview} setPreview={setPreview}
+              blocks={result?.blocks}
+              highlightedBlockIndex={highlightedBlockIndex}
+              setHighlightedBlockIndex={setHighlightedBlockIndex}
+              txtContent={txtContent}
+              setTxtContent={setTxtContent}
+              setPointerMeta={setPointerMeta}
+              fullText={result?.text ?? ""}
+              blockSpans={blockSpans}
+              onClearSession={handleClearSession}
+            />
+            <ResultPanel
+              result={result}
+              loading={loading}
+              progress={progress}
+              progressEvents={progressEvents}
+              error={error}
+              onExport={handleExport}
+              onExportMarkdown={handleExportMarkdown}
+              summary={summary}
+              summaryLoading={summaryLoading}
+              summaryError={summaryError}
+              onSummarize={handleSummarize}
+              vlmEnabled={!!vlmConfig?.enabled}
+              highlightedBlockIndex={highlightedBlockIndex}
+              setHighlightedBlockIndex={setHighlightedBlockIndex}
+              activeTab={activeTab}
+              setActiveTab={setActiveTab}
+              blockSpans={blockSpans}
+              setPointerMeta={setPointerMeta}
+              rawPreRef={rawPreRef}
+            />
+          </div>
+        ) : activeView === "config" ? (
+          <ConfigPanel vlmConfig={vlmConfig} setVlmConfig={setVlmConfig} />
+        ) : (
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#0d1117", color: "#8b949e", fontSize: 14 }}>
+            {activeView} view is not implemented in this demo yet.
+          </div>
+        )}
         <div style={{
           height: 40, background: "#161b22", borderTop: "1px solid #30363d",
           display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 24px", fontSize: 12, color: "#8b949e"
@@ -1138,13 +1989,13 @@ function App() {
             <span title={pointerLabel}>{pointerLabel}</span>
           </div>
           <div style={{ display: "flex", gap: 16, flexShrink: 0 }}>
-            <span>Engine: {result ? "PaddleOCR" : "Ready"}</span>
+            <span>Engine: {engineLabel}</span>
             {result && <span>Conf: {avgConfidence.toFixed(1)}%</span>}
             {file && <span>{file.name}</span>}
           </div>
         </div>
       </div>
-      {file && (
+      {file && activeView === "workspace" && (
         <button onClick={handleProcess} disabled={loading} style={{
           position: "fixed", bottom: 80, left: "50%", transform: "translateX(-50%)",
           padding: "14px 32px", background: "#6366f1", color: "#fff", border: "none",

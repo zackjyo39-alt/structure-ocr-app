@@ -1,10 +1,49 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import base64
 from dataclasses import dataclass, field
+from typing import Generator
+
+
+# ---------------------------------------------------------------------------
+# SSE Progress Events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProgressEvent:
+    stage: str
+    message: str
+    page: int | None = None
+    total_pages: int | None = None
+    progress: float = 0.0
+    engine: str | None = None
+    extra: dict | None = None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "stage": self.stage,
+            "message": self.message,
+            "progress": round(self.progress, 4),
+        }
+        if self.page is not None:
+            d["page"] = self.page
+        if self.total_pages is not None:
+            d["total_pages"] = self.total_pages
+        if self.engine is not None:
+            d["engine"] = self.engine
+        if self.extra is not None:
+            d["extra"] = self.extra
+        return d
+
+
+def sse_format(event: ProgressEvent) -> str:
+    """Format a ProgressEvent as an SSE message line."""
+    data = json.dumps(event.to_dict(), ensure_ascii=False)
+    return f"event: {event.stage}\ndata: {data}\n\n"
 
 
 @dataclass
@@ -176,6 +215,77 @@ def _blocks_from_normalized_page_text(
             }
         )
     return out
+
+
+def _reconstruct_layout(res_data) -> tuple[list[dict], str]:
+    if isinstance(res_data, dict):
+        res_dict = res_data.get("res", res_data)
+        dt_polys = res_dict.get("dt_polys", [])
+        rec_texts = res_dict.get("rec_texts", res_dict.get("rec_text", []))
+        rec_scores = res_dict.get("rec_scores", res_dict.get("rec_score", []))
+        elements = []
+        for i in range(len(dt_polys)):
+            bbox = dt_polys[i]
+            txt = rec_texts[i] if i < len(rec_texts) else ""
+            score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
+            ys = [p[1] for p in bbox]
+            xs = [p[0] for p in bbox]
+            elements.append({
+                "bbox": bbox, "text": txt, "score": score,
+                "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
+                "center_y": (min(ys) + max(ys)) / 2, "height": max(ys) - min(ys)
+            })
+    else:
+        elements = []
+        for line in (res_data if res_data else []):
+            bbox, (txt, score) = line
+            ys = [p[1] for p in bbox]
+            xs = [p[0] for p in bbox]
+            elements.append({
+                "bbox": bbox, "text": txt, "score": float(score),
+                "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
+                "center_y": (min(ys) + max(ys)) / 2, "height": max(ys) - min(ys)
+            })
+
+    if not elements:
+        return [], ""
+
+    elements.sort(key=lambda e: e["center_y"])
+    lines, current_line = [], []
+    for el in elements:
+        if not current_line:
+            current_line.append(el)
+        else:
+            avg_h = sum(e["height"] for e in current_line) / len(current_line)
+            mean_cy = sum(e["center_y"] for e in current_line) / len(current_line)
+            if abs(el["center_y"] - mean_cy) < avg_h * 0.4:
+                current_line.append(el)
+            else:
+                lines.append(current_line)
+                current_line = [el]
+    if current_line:
+        lines.append(current_line)
+        
+    extracted_blocks, formatted_rows = [], []
+    for line in lines:
+        line.sort(key=lambda e: e["min_x"])
+        row_str = ""
+        last_x = None
+        for el in line:
+            extracted_blocks.append(el)
+            if last_x is not None:
+                gap = el["min_x"] - last_x
+                c_w = el["height"] * 0.5
+                if c_w > 0 and gap > c_w * 1.5:
+                    spaces = int(gap / c_w)
+                    row_str += " " * min(spaces, 40)
+                else:
+                    row_str += " "
+            row_str += el["text"]
+            last_x = el["max_x"]
+        formatted_rows.append(row_str)
+        
+    return extracted_blocks, "\n".join(formatted_rows)
 
 
 def _extract_bbox_from_item(item: dict) -> list[float] | None:
@@ -423,19 +533,103 @@ class DocumentExtractor:
             notes.append("Could not open image file; the file may be corrupted or invalid.")
             return {"pages": 0, "text": "", "blocks": [], "notes": notes}
             
+        return self._process_image_pil(image_pil, image_data, notes)
+
+    def _process_image_pil(
+        self, image_pil: Image.Image, image_data: str | None, notes: list[str]
+    ) -> dict:
+        blocks: list[dict] = []
+        text = ""
+        w, h = image_pil.size
+
         ocr = self._load_ocr()
         structure = self._load_structure()
-        
+        from app.vlm import is_vlm_enabled, extract_via_vlm
+
+        image = None
         if structure or ocr:
             try:
                 import numpy as np
                 image = np.array(image_pil)[:, :, ::-1].copy()
             except ImportError:
-                notes.append("Numpy is not installed; returning image metadata only.")
-                return {"pages": 1, "text": "", "blocks": [], "notes": notes, "page_infos": [{"page": 1, "width": float(image_pil.width), "height": float(image_pil.height), "image_data": image_data, "columns": None, "layout_type": None}]}
-        blocks: list[dict] = []
-        text = ""
-        w, h = image_pil.size
+                notes.append("Numpy is not installed; OCR/Structure fallback unavailable.")
+
+        # --- Dual-Engine Consensus: Get OCR hints first if VLM is enabled ---
+        ocr_hints = None
+        extracted_ocr_blocks = None
+        if is_vlm_enabled() and ocr is not None and image is not None:
+            try:
+                try:
+                    result = ocr.ocr(image, cls=True)
+                except TypeError:
+                    result = ocr.ocr(image)
+                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                if ocr_text.strip():
+                    ocr_hints = ocr_text
+            except Exception as e:
+                notes.append(f"Pre-VLM OCR extraction failed: {e}")
+
+        # --- VLM Extraction ---
+        vlm_blocks = None
+        if is_vlm_enabled() and image_data:
+            try:
+                b64_stripped = image_data.split(",", 1)[-1] if "," in image_data else image_data
+                vlm_blocks = extract_via_vlm(b64_stripped, ocr_hints=ocr_hints)
+                if vlm_blocks is None:
+                    notes.append("VLM 未返回结果 — 已自动回退到几何布局提取。")
+            except Exception as e:
+                notes.append(f"VLM 调用失败: {e}。已自动回退到几何布局提取。")
+
+        if vlm_blocks is not None:
+            from app.vlm import get_vlm_config
+            from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+
+            cfg = get_vlm_config()
+            engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+
+            ocr_combined_text = ocr_hints or ""
+
+            if extracted_ocr_blocks:
+                consensus = compute_consensus_score(vlm_blocks, extracted_ocr_blocks, ocr_combined_text)
+                notes.extend(consensus["warnings"])
+
+            for idx, el in enumerate(vlm_blocks):
+                txt = el.get("text", "")
+                bbox = el.get("bbox")
+                if not bbox or len(bbox) != 4 or bbox == [0,0,0,0]:
+                    bbox = None
+                blocks.append({
+                    "page": 1,
+                    "type": el.get("type", "text"),
+                    "structure_type": "text",
+                    "text": txt,
+                    "bbox": bbox,
+                    "confidence": compute_vlm_confidence(el, extracted_ocr_blocks, ocr_combined_text),
+                    "reading_order": idx,
+                    "hierarchy_level": el.get("hierarchy_level", 4),
+                    "parent_id": None,
+                    "relations": [],
+                    "group_id": el.get("group_id", "single"),
+                    "table_html": None,
+                })
+
+            field_warnings = validate_legal_fields(blocks)
+            notes.extend(field_warnings)
+
+            return {
+                "pages": 1,
+                "text": "\n".join([b["text"] for b in blocks]),
+                "blocks": blocks,
+                "notes": notes,
+                "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                "vlm_used": True,
+                "vlm_engine": engine_str,
+            }
+        
+        # --- Fallback: Geometric Structure & OCR ---
+        if image is None:
+            return {"pages": 1, "text": "", "blocks": [], "notes": notes, "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}], "vlm_used": False, "vlm_engine": None}
         
         if structure:
             try:
@@ -445,54 +639,35 @@ class DocumentExtractor:
                 )
                 if struct_blocks:
                     _analyze_spatial_relations(struct_blocks, float(w), float(h))
-                    page_texts = [b["text"] for b in struct_blocks if b["text"]]
+                    page_texts = [b["text"] for b in struct_blocks if b["text"] and b.get("type") not in ("header", "footer")]
                     return {
                         "pages": 1,
                         "text": "\n".join(page_texts),
                         "blocks": struct_blocks,
                         "notes": notes,
                         "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                        "vlm_used": False,
+                        "vlm_engine": None,
                     }
             except Exception as e:
                 notes.append(f"structure parse failed; fell back to OCR ({e})")
 
         if not ocr:
             notes.append("PaddleOCR is not installed; returning image metadata only.")
-            return {"pages": 1, "text": "", "blocks": blocks, "notes": notes, "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}]}
-            
-        try:
-            try:
-                result = ocr.ocr(image, cls=True)
-            except TypeError:
-                result = ocr.ocr(image)
-            extracted_lines = []
-            res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-            if isinstance(res_data, dict):
-                res_dict = res_data.get("res", res_data)
-                dt_polys = res_dict.get("dt_polys", [])
-                rec_texts = res_dict.get("rec_texts", res_dict.get("rec_text", []))
-                rec_scores = res_dict.get("rec_scores", res_dict.get("rec_score", []))
-                for i in range(len(dt_polys)):
-                    bbox = dt_polys[i]
-                    txt = rec_texts[i] if i < len(rec_texts) else ""
-                    score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
-                    extracted_lines.append((bbox, (txt, score)))
-            else:
-                extracted_lines = res_data if res_data else []
-
-            page_text = []
-            for line in extracted_lines:
-                bbox, (txt, score) = line
-                page_text.append(txt)
+            return {"pages": 1, "text": "", "blocks": blocks, "notes": notes, "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}], "vlm_used": False, "vlm_engine": None}
+        
+        # Use extracted OCR blocks if we already computed them
+        if extracted_ocr_blocks is not None:
+            for idx, el in enumerate(extracted_ocr_blocks):
                 blocks.append(
                     {
                         "page": 1,
                         "type": "text",
                         "structure_type": "text",
-                        "text": txt,
-                        "bbox": [float(v) for point in bbox for v in point],
-                        "confidence": float(score),
-                        "reading_order": len(page_text) - 1,
+                        "text": el["text"],
+                        "bbox": [float(v) for point in el["bbox"] for v in point],
+                        "confidence": el["score"],
+                        "reading_order": idx,
                         "hierarchy_level": 4,
                         "parent_id": None,
                         "relations": [],
@@ -500,17 +675,43 @@ class DocumentExtractor:
                         "table_html": None,
                     }
                 )
-            text = "\n".join(page_text)
-        except Exception as exc:
-            notes.append(f"OCR failed ({exc})")
-            text = ""
+        else:
+            try:
+                try:
+                    result = ocr.ocr(image, cls=True)
+                except TypeError:
+                    result = ocr.ocr(image)
+                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                extracted_blocks, text = _reconstruct_layout(res_data)
+                for idx, el in enumerate(extracted_blocks):
+                    blocks.append(
+                        {
+                            "page": 1,
+                            "type": "text",
+                            "structure_type": "text",
+                            "text": el["text"],
+                            "bbox": [float(v) for point in el["bbox"] for v in point],
+                            "confidence": el["score"],
+                            "reading_order": idx,
+                            "hierarchy_level": 4,
+                            "parent_id": None,
+                            "relations": [],
+                            "group_id": "single",
+                            "table_html": None,
+                        }
+                    )
+            except Exception as exc:
+                notes.append(f"OCR failed ({exc})")
+                text = ""
 
         return {
             "pages": 1,
-            "text": text,
+            "text": text if "text" in locals() and text else "\n".join([b["text"] for b in blocks]),
             "blocks": blocks,
             "notes": notes,
             "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+            "vlm_used": False,
+            "vlm_engine": None,
         }
 
     def _extract_pdf(self, raw: bytes, notes: list[str]) -> dict:
@@ -535,34 +736,141 @@ class DocumentExtractor:
         full_text: list[str] = []
         ocr = self._load_ocr()
         structure = self._load_structure()
+        from app.vlm import is_vlm_enabled, extract_via_vlm, get_vlm_config
+        
+        vlm_used_any = False
+        cfg = get_vlm_config()
+        vlm_engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+        
+        import concurrent.futures
+        
+        # Step 1: Pre-process pages & run sequential PaddleOCR
+        # PaddleOCR is run sequentially to avoid thread-safety issues with its C++ runtime
+        page_tasks = []
         for page_index, page in enumerate(doc, start=1):
             page_text = page.get_text("text").strip()
             if page_text:
-                normalized_text = _normalize_pdf_line_breaks(page_text)
-                full_text.append(normalized_text)
-                blocks.append({"page": page_index, "type": "native_text", "text": normalized_text})
+                page_tasks.append({"page_index": page_index, "type": "native_text", "text": page_text})
                 continue
-
+            
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             image_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
             
+            image = None
             if structure or ocr:
                 try:
                     import numpy as np
                     image = np.array(image_pil)[:, :, ::-1].copy()
                 except ImportError:
                     notes.append(f"page {page_index}: Numpy is unavailable")
-                    continue
+            
+            # Get OCR hints first if VLM is enabled
+            ocr_hints = None
+            extracted_ocr_blocks = None
+            if is_vlm_enabled() and ocr is not None and image is not None:
+                try:
+                    try:
+                        result = ocr.ocr(image, cls=True)
+                    except TypeError:
+                        result = ocr.ocr(image)
+                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                    extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                    if ocr_text.strip():
+                        ocr_hints = ocr_text
+                except Exception as e:
+                    notes.append(f"page {page_index}: Pre-VLM OCR extraction failed ({e})")
+            
+            page_tasks.append({
+                "page_index": page_index, "type": "image", "image_pil": image_pil, "image": image,
+                "pix_width": pix.width, "pix_height": pix.height,
+                "ocr_hints": ocr_hints, "extracted_ocr_blocks": extracted_ocr_blocks,
+                "vlm_blocks": None
+            })
+
+        # Step 2: Concurrent VLM Execution
+        # VLM is network-bound, so thread pool gives near linear speedup
+        if is_vlm_enabled():
+            def _run_vlm(task):
+                buffered = io.BytesIO()
+                task["image_pil"].save(buffered, format="PNG")
+                b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                try:
+                    return extract_via_vlm(b64, ocr_hints=task["ocr_hints"])
+                except Exception as e:
+                    return {"_error": str(e)}
+            
+            vlm_futures = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                for task in page_tasks:
+                    if task["type"] == "image":
+                        vlm_futures[task["page_index"]] = executor.submit(_run_vlm, task)
+            
+            for task in page_tasks:
+                if task["type"] == "image":
+                    res = vlm_futures[task["page_index"]].result()
+                    if isinstance(res, dict) and "_error" in res:
+                        notes.append(f"page {task['page_index']}: VLM 调用失败 ({res['_error']})。已回退到几何布局提取。")
+                    elif res is None:
+                        notes.append(f"page {task['page_index']}: VLM 未返回结果 — 请确认 VLM 服务是否已启动。已回退到几何布局提取。")
+                    else:
+                        task["vlm_blocks"] = res
+
+        # Step 3: Accumulate final layout and text
+        for task in page_tasks:
+            page_index = task["page_index"]
+            if task["type"] == "native_text":
+                normalized_text = _normalize_pdf_line_breaks(task["text"])
+                full_text.append(normalized_text)
+                blocks.append({"page": page_index, "type": "native_text", "text": normalized_text})
+                continue
+            
+            vlm_blocks = task["vlm_blocks"]
+            image = task["image"]
+            extracted_ocr_blocks = task["extracted_ocr_blocks"]
+            ocr_hints = task["ocr_hints"]
+            pix_width = task["pix_width"]
+            pix_height = task["pix_height"]
+            
+            if vlm_blocks is not None:
+                vlm_used_any = True
+                from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+
+                ocr_combined_text = ocr_hints or ""
+                if extracted_ocr_blocks:
+                    consensus = compute_consensus_score(vlm_blocks, extracted_ocr_blocks, ocr_combined_text)
+                    notes.extend(consensus["warnings"])
+
+                page_lines = []
+                for idx, el in enumerate(vlm_blocks):
+                    txt = el.get("text", "")
+                    page_lines.append(txt)
+                    bbox = el.get("bbox")
+                    if not bbox or len(bbox) != 4 or bbox == [0,0,0,0]:
+                        bbox = None
+                    blocks.append({
+                        "page": page_index, "type": el.get("type", "text"), "structure_type": "text",
+                        "text": txt, "bbox": bbox,
+                        "confidence": compute_vlm_confidence(el, extracted_ocr_blocks, ocr_combined_text),
+                        "reading_order": idx, "hierarchy_level": el.get("hierarchy_level", 4),
+                        "parent_id": None, "relations": [], "group_id": el.get("group_id", "single"),
+                        "table_html": None,
+                    })
+                full_text.append(_normalize_pdf_line_breaks("\n".join(page_lines)))
+
+                field_warnings = validate_legal_fields([b for b in blocks if b["page"] == page_index])
+                notes.extend(field_warnings)
+                continue
+
+            if image is None:
+                continue
 
             if structure:
                 try:
                     structure_result = structure(image)
-                    struct_blocks = _blocks_from_structure_result(
-                        page_index, structure_result, float(pix.width), float(pix.height)
-                    )
+                    struct_blocks = _blocks_from_structure_result(page_index, structure_result, float(pix_width), float(pix_height))
                     if struct_blocks:
-                        _analyze_spatial_relations(struct_blocks, float(pix.width), float(pix.height))
-                        page_texts = [b["text"] for b in struct_blocks if b["text"]]
+                        _analyze_spatial_relations(struct_blocks, float(pix_width), float(pix_height))
+                        page_texts = [b["text"] for b in struct_blocks if b["text"] and b.get("type") not in ("header", "footer")]
                         full_text.append("\n".join(page_texts))
                         blocks.extend(struct_blocks)
                         continue
@@ -573,49 +881,34 @@ class DocumentExtractor:
                 notes.append(f"page {page_index}: PaddleOCR unavailable")
                 continue
 
-            try:
-                try:
-                    result = ocr.ocr(image, cls=True)
-                except TypeError:
-                    result = ocr.ocr(image)
-                page_lines: list[str] = []
-                scores: list[float] = []
-                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                extracted_lines = []
-                if isinstance(res_data, dict):
-                    res_dict = res_data.get("res", res_data)
-                    dt_polys = res_dict.get("dt_polys", [])
-                    rec_texts = res_dict.get("rec_texts", res_dict.get("rec_text", []))
-                    rec_scores = res_dict.get("rec_scores", res_dict.get("rec_score", []))
-                    for i in range(len(dt_polys)):
-                        bbox = dt_polys[i]
-                        txt = rec_texts[i] if i < len(rec_texts) else ""
-                        score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
-                        extracted_lines.append((bbox, (txt, score)))
-                else:
-                    extracted_lines = res_data if res_data else []
-
-                for line in extracted_lines:
-                    bbox, (txt, score) = line
-                    page_lines.append(txt)
-                    scores.append(float(score))
-                normalized = _normalize_pdf_line_breaks("\n".join(page_lines))
-                avg_conf = sum(scores) / len(scores) if scores else None
-                full_text.append(normalized)
-                fallback_blocks = _blocks_from_normalized_page_text(page_index, normalized, confidence=avg_conf)
-                for fb in fallback_blocks:
-                    fb.update({
-                        "structure_type": "text",
-                        "reading_order": None,
-                        "hierarchy_level": 4,
-                        "parent_id": None,
-                        "relations": [],
-                        "group_id": "single",
-                        "table_html": None,
+            if extracted_ocr_blocks is not None:
+                for idx, el in enumerate(extracted_ocr_blocks):
+                    blocks.append({
+                        "page": page_index, "type": "text", "structure_type": "text",
+                        "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
+                        "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
+                        "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
                     })
-                blocks.extend(fallback_blocks)
-            except Exception as exc:
-                notes.append(f"page {page_index}: OCR failed ({exc})")
+                if ocr_hints:
+                    full_text.append(ocr_hints)
+            else:
+                try:
+                    try:
+                        result = ocr.ocr(image, cls=True)
+                    except TypeError:
+                        result = ocr.ocr(image)
+                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                    extracted_blocks, normalized = _reconstruct_layout(res_data)
+                    full_text.append(normalized)
+                    for idx, el in enumerate(extracted_blocks):
+                        blocks.append({
+                            "page": page_index, "type": "text", "structure_type": "text",
+                            "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
+                            "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
+                            "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                        })
+                except Exception as exc:
+                    notes.append(f"page {page_index}: OCR failed ({exc})")
 
         page_infos = []
         for page_index, page in enumerate(doc, start=1):
@@ -637,4 +930,478 @@ class DocumentExtractor:
             "blocks": blocks,
             "notes": notes,
             "page_infos": page_infos,
+            "vlm_used": vlm_used_any,
+            "vlm_engine": vlm_engine_str if vlm_used_any else None,
         }
+
+    def extract_stream(
+        self, raw: bytes, filename: str, suffix: str, mime_type: str
+    ) -> Generator[str, None, None]:
+        """Generator yielding SSE-formatted progress events during extraction."""
+        try:
+            if suffix == ".txt" or mime_type == "text/plain":
+                yield sse_format(ProgressEvent(
+                    stage="upload_received", message=f"Text file detected: {filename}", progress=0.05,
+                ))
+                result = self._extract_text(raw, [])
+                yield sse_format(ProgressEvent(
+                    stage="complete", message="Text extraction complete", progress=1.0,
+                    extra={"result": result},
+                ))
+                return
+
+            if suffix == ".pdf" or mime_type == "application/pdf":
+                yield from self._extract_pdf_stream(raw, filename)
+                return
+
+            yield from self._extract_image_stream(raw, filename)
+
+        except Exception as exc:
+            yield sse_format(ProgressEvent(
+                stage="error", message=str(exc), progress=0.0,
+                extra={"filename": filename},
+            ))
+
+    def _extract_image_stream(
+        self, raw: bytes, filename: str
+    ) -> Generator[str, None, None]:
+        try:
+            from PIL import Image
+        except ImportError:
+            yield sse_format(ProgressEvent(
+                stage="error", message="Pillow is not installed", progress=0.0,
+            ))
+            return
+
+        try:
+            image_pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            buffered = io.BytesIO()
+            image_pil.save(buffered, format="PNG")
+            image_data = f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
+        except Exception:
+            yield sse_format(ProgressEvent(
+                stage="error", message="Could not open image file", progress=0.0,
+            ))
+            return
+
+        notes: list[str] = []
+        w, h = image_pil.size
+
+        yield sse_format(ProgressEvent(
+            stage="model_loading", message="Loading OCR models...", progress=0.1,
+        ))
+
+        ocr = self._load_ocr()
+        structure = self._load_structure()
+        from app.vlm import is_vlm_enabled, extract_via_vlm
+
+        image = None
+        if structure or ocr:
+            try:
+                import numpy as np
+                image = np.array(image_pil)[:, :, ::-1].copy()
+            except ImportError:
+                notes.append("Numpy is not installed; OCR/Structure fallback unavailable.")
+
+        # VLM attempt
+        if is_vlm_enabled() and image_data:
+            ocr_hints = None
+            if ocr is not None and image is not None:
+                try:
+                    try:
+                        result = ocr.ocr(image, cls=True)
+                    except TypeError:
+                        result = ocr.ocr(image)
+                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                    _, ocr_text = _reconstruct_layout(res_data)
+                    if ocr_text.strip():
+                        ocr_hints = ocr_text
+                except Exception:
+                    pass
+
+            yield sse_format(ProgressEvent(
+                stage="page_vlm_start", message="VLM analyzing image...", page=1, total_pages=1,
+                progress=0.2, engine="vlm",
+            ))
+
+            try:
+                b64_stripped = image_data.split(",", 1)[-1] if "," in image_data else image_data
+                vlm_blocks = extract_via_vlm(b64_stripped, ocr_hints=ocr_hints)
+            except Exception as e:
+                vlm_blocks = None
+                notes.append(f"VLM 调用失败: {e}。已自动回退到几何布局提取。")
+
+            if vlm_blocks is not None:
+                from app.vlm import get_vlm_config
+                from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+
+                cfg = get_vlm_config()
+                engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+
+                blocks = []
+                for idx, el in enumerate(vlm_blocks):
+                    txt = el.get("text", "")
+                    bbox = el.get("bbox")
+                    if not bbox or len(bbox) != 4 or bbox == [0, 0, 0, 0]:
+                        bbox = None
+                    blocks.append({
+                        "page": 1, "type": el.get("type", "text"), "structure_type": "text",
+                        "text": txt, "bbox": bbox,
+                        "confidence": compute_vlm_confidence(el, [], ""),
+                        "reading_order": idx, "hierarchy_level": el.get("hierarchy_level", 4),
+                        "parent_id": None, "relations": [], "group_id": el.get("group_id", "single"),
+                        "table_html": None,
+                    })
+
+                field_warnings = validate_legal_fields(blocks)
+                notes.extend(field_warnings)
+
+                result = {
+                    "pages": 1, "text": "\n".join([b["text"] for b in blocks]),
+                    "blocks": blocks, "notes": notes,
+                    "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                    "vlm_used": True, "vlm_engine": engine_str,
+                }
+
+                yield sse_format(ProgressEvent(
+                    stage="page_vlm_done", message="VLM extraction complete", page=1, total_pages=1,
+                    progress=0.9, engine="vlm",
+                ))
+                yield sse_format(ProgressEvent(
+                    stage="complete", message="Extraction complete", progress=1.0,
+                    extra={"result": result},
+                ))
+                return
+
+            yield sse_format(ProgressEvent(
+                stage="ocr_fallback", message="VLM unavailable, falling back to OCR...", page=1, total_pages=1,
+                progress=0.5, engine="ocr",
+            ))
+
+        # Structure fallback
+        if structure and image is not None:
+            yield sse_format(ProgressEvent(
+                stage="structure_fallback", message="Running PPStructure layout analysis...", page=1, total_pages=1,
+                progress=0.5, engine="structure",
+            ))
+            try:
+                structure_result = structure(image)
+                struct_blocks = _blocks_from_structure_result(1, structure_result, float(w), float(h))
+                if struct_blocks:
+                    _analyze_spatial_relations(struct_blocks, float(w), float(h))
+                    page_texts = [b["text"] for b in struct_blocks if b["text"] and b.get("type") not in ("header", "footer")]
+                    result = {
+                        "pages": 1, "text": "\n".join(page_texts), "blocks": struct_blocks, "notes": notes,
+                        "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                        "vlm_used": False, "vlm_engine": None,
+                    }
+                    yield sse_format(ProgressEvent(
+                        stage="complete", message="Structure extraction complete", progress=1.0,
+                        extra={"result": result},
+                    ))
+                    return
+            except Exception as e:
+                notes.append(f"structure parse failed; fell back to OCR ({e})")
+
+        # Geometric OCR fallback
+        if ocr is not None and image is not None:
+            yield sse_format(ProgressEvent(
+                stage="ocr_fallback", message="Running geometric OCR...", page=1, total_pages=1,
+                progress=0.6, engine="ocr",
+            ))
+            try:
+                try:
+                    result = ocr.ocr(image, cls=True)
+                except TypeError:
+                    result = ocr.ocr(image)
+                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                extracted_blocks, text = _reconstruct_layout(res_data)
+                blocks = []
+                for idx, el in enumerate(extracted_blocks):
+                    blocks.append({
+                        "page": 1, "type": "text", "structure_type": "text",
+                        "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
+                        "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
+                        "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                    })
+                result = {
+                    "pages": 1, "text": text, "blocks": blocks, "notes": notes,
+                    "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                    "vlm_used": False, "vlm_engine": None,
+                }
+                yield sse_format(ProgressEvent(
+                    stage="complete", message="OCR extraction complete", progress=1.0,
+                    extra={"result": result},
+                ))
+                return
+            except Exception as exc:
+                notes.append(f"OCR failed ({exc})")
+
+        # Empty result
+        result = {
+            "pages": 1, "text": "", "blocks": [], "notes": notes,
+            "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+            "vlm_used": False, "vlm_engine": None,
+        }
+        yield sse_format(ProgressEvent(
+            stage="complete", message="Extraction complete (no content extracted)", progress=1.0,
+            extra={"result": result},
+        ))
+
+    def _extract_pdf_stream(self, raw: bytes, filename: str) -> Generator[str, None, None]:
+        try:
+            import fitz
+        except ImportError:
+            yield sse_format(ProgressEvent(
+                stage="error", message="PyMuPDF is not installed; cannot process PDF files.", progress=0.0,
+            ))
+            return
+
+        try:
+            from PIL import Image
+        except ImportError:
+            yield sse_format(ProgressEvent(
+                stage="error", message="Pillow is not installed; cannot process PDF pages.", progress=0.0,
+            ))
+            return
+
+        try:
+            doc = fitz.open(stream=raw, filetype="pdf")
+        except Exception:
+            yield sse_format(ProgressEvent(
+                stage="error", message="Could not open PDF file; the file may be corrupted or invalid.", progress=0.0,
+            ))
+            return
+
+        total_pages = len(doc)
+        notes: list[str] = []
+        blocks: list[dict] = []
+        full_text: list[str] = []
+
+        yield sse_format(ProgressEvent(
+            stage="upload_received", message=f"PDF detected: {filename} ({total_pages} pages)", progress=0.05,
+            total_pages=total_pages,
+        ))
+
+        yield sse_format(ProgressEvent(
+            stage="model_loading", message="Loading OCR models...", progress=0.1,
+            total_pages=total_pages,
+        ))
+
+        ocr = self._load_ocr()
+        structure = self._load_structure()
+        from app.vlm import is_vlm_enabled, extract_via_vlm, get_vlm_config
+
+        vlm_used_any = False
+        cfg = get_vlm_config()
+        vlm_engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+
+        # Step 1: Pre-process pages sequentially
+        page_tasks = []
+        for page_index, page in enumerate(doc, start=1):
+            page_text = page.get_text("text").strip()
+            if page_text:
+                yield sse_format(ProgressEvent(
+                    stage="page_native_text", message=f"Page {page_index}/{total_pages}: native text extracted",
+                    page=page_index, total_pages=total_pages,
+                    progress=0.1 + (page_index / total_pages) * 0.2, engine="native_text",
+                ))
+                page_tasks.append({"page_index": page_index, "type": "native_text", "text": page_text})
+                continue
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+            image = None
+            if structure or ocr:
+                try:
+                    import numpy as np
+                    image = np.array(image_pil)[:, :, ::-1].copy()
+                except ImportError:
+                    notes.append(f"page {page_index}: Numpy is unavailable")
+
+            ocr_hints = None
+            extracted_ocr_blocks = None
+            if is_vlm_enabled() and ocr is not None and image is not None:
+                try:
+                    try:
+                        result = ocr.ocr(image, cls=True)
+                    except TypeError:
+                        result = ocr.ocr(image)
+                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                    extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                    if ocr_text.strip():
+                        ocr_hints = ocr_text
+                except Exception as e:
+                    notes.append(f"page {page_index}: Pre-VLM OCR extraction failed ({e})")
+
+            yield sse_format(ProgressEvent(
+                stage="page_ocr_done", message=f"Page {page_index}/{total_pages}: OCR hints extracted",
+                page=page_index, total_pages=total_pages,
+                progress=0.1 + (page_index / total_pages) * 0.25, engine="ocr",
+            ))
+
+            page_tasks.append({
+                "page_index": page_index, "type": "image", "image_pil": image_pil, "image": image,
+                "pix_width": pix.width, "pix_height": pix.height,
+                "ocr_hints": ocr_hints, "extracted_ocr_blocks": extracted_ocr_blocks,
+                "vlm_blocks": None,
+            })
+
+        # Step 2: Concurrent VLM
+        if is_vlm_enabled():
+            import concurrent.futures
+
+            def _run_vlm(task):
+                buffered = io.BytesIO()
+                task["image_pil"].save(buffered, format="PNG")
+                b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                try:
+                    return extract_via_vlm(b64, ocr_hints=task["ocr_hints"])
+                except Exception as e:
+                    return {"_error": str(e)}
+
+            vlm_futures = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                for task in page_tasks:
+                    if task["type"] == "image":
+                        vlm_futures[task["page_index"]] = executor.submit(_run_vlm, task)
+
+            for task in page_tasks:
+                if task["type"] == "image":
+                    pi = task["page_index"]
+                    yield sse_format(ProgressEvent(
+                        stage="page_vlm_start", message=f"Page {pi}/{total_pages}: VLM analyzing...",
+                        page=pi, total_pages=total_pages,
+                        progress=0.35 + (pi / total_pages) * 0.4, engine="vlm",
+                    ))
+                    res = vlm_futures[pi].result()
+                    if isinstance(res, dict) and "_error" in res:
+                        notes.append(f"page {pi}: VLM 调用失败 ({res['_error']})。已回退到几何布局提取。")
+                    elif res is None:
+                        notes.append(f"page {pi}: VLM 未返回结果 — 请确认 VLM 服务是否已启动。已回退到几何布局提取。")
+                    else:
+                        task["vlm_blocks"] = res
+                        vlm_used_any = True
+
+                    yield sse_format(ProgressEvent(
+                        stage="page_vlm_done", message=f"Page {pi}/{total_pages}: VLM analysis complete",
+                        page=pi, total_pages=total_pages,
+                        progress=0.35 + ((pi + 0.5) / total_pages) * 0.4, engine="vlm",
+                    ))
+
+        # Step 3: Accumulate results
+        for task in page_tasks:
+            page_index = task["page_index"]
+            if task["type"] == "native_text":
+                normalized_text = _normalize_pdf_line_breaks(task["text"])
+                full_text.append(normalized_text)
+                blocks.append({"page": page_index, "type": "native_text", "text": normalized_text})
+                continue
+
+            vlm_blocks = task["vlm_blocks"]
+            image = task["image"]
+            extracted_ocr_blocks = task["extracted_ocr_blocks"]
+            ocr_hints = task["ocr_hints"]
+            pix_width = task["pix_width"]
+            pix_height = task["pix_height"]
+
+            if vlm_blocks is not None:
+                from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+
+                ocr_combined_text = ocr_hints or ""
+                if extracted_ocr_blocks:
+                    consensus = compute_consensus_score(vlm_blocks, extracted_ocr_blocks, ocr_combined_text)
+                    notes.extend(consensus["warnings"])
+
+                for idx, el in enumerate(vlm_blocks):
+                    txt = el.get("text", "")
+                    bbox = el.get("bbox")
+                    if not bbox or len(bbox) != 4 or bbox == [0, 0, 0, 0]:
+                        bbox = None
+                    blocks.append({
+                        "page": page_index, "type": el.get("type", "text"), "structure_type": "text",
+                        "text": txt, "bbox": bbox,
+                        "confidence": compute_vlm_confidence(el, extracted_ocr_blocks, ocr_combined_text),
+                        "reading_order": idx, "hierarchy_level": el.get("hierarchy_level", 4),
+                        "parent_id": None, "relations": [], "group_id": el.get("group_id", "single"),
+                        "table_html": None,
+                    })
+                full_text.append(_normalize_pdf_line_breaks("\n".join([el.get("text", "") for el in vlm_blocks])))
+
+                field_warnings = validate_legal_fields([b for b in blocks if b["page"] == page_index])
+                notes.extend(field_warnings)
+                continue
+
+            if image is None:
+                continue
+
+            if structure:
+                try:
+                    structure_result = structure(image)
+                    struct_blocks = _blocks_from_structure_result(page_index, structure_result, float(pix_width), float(pix_height))
+                    if struct_blocks:
+                        _analyze_spatial_relations(struct_blocks, float(pix_width), float(pix_height))
+                        page_texts = [b["text"] for b in struct_blocks if b["text"] and b.get("type") not in ("header", "footer")]
+                        full_text.append("\n".join(page_texts))
+                        blocks.extend(struct_blocks)
+                        continue
+                except Exception:
+                    notes.append(f"structure parse failed on page {page_index}; fell back to OCR")
+
+            if not ocr:
+                notes.append(f"page {page_index}: PaddleOCR unavailable")
+                continue
+
+            if extracted_ocr_blocks is not None:
+                for idx, el in enumerate(extracted_ocr_blocks):
+                    blocks.append({
+                        "page": page_index, "type": "text", "structure_type": "text",
+                        "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
+                        "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
+                        "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                    })
+                if ocr_hints:
+                    full_text.append(ocr_hints)
+            else:
+                try:
+                    try:
+                        result = ocr.ocr(image, cls=True)
+                    except TypeError:
+                        result = ocr.ocr(image)
+                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                    extracted_blocks, normalized = _reconstruct_layout(res_data)
+                    full_text.append(normalized)
+                    for idx, el in enumerate(extracted_blocks):
+                        blocks.append({
+                            "page": page_index, "type": "text", "structure_type": "text",
+                            "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
+                            "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
+                            "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                        })
+                except Exception as exc:
+                    notes.append(f"page {page_index}: OCR failed ({exc})")
+
+        page_infos = []
+        for page_index, page in enumerate(doc, start=1):
+            rect = page.rect
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image_data = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode('utf-8')}"
+            page_infos.append({
+                "page": page_index, "width": rect.width, "height": rect.height,
+                "image_data": image_data, "columns": None, "layout_type": None,
+            })
+
+        result = {
+            "pages": len(doc),
+            "text": "\n\n".join(part for part in full_text if part),
+            "blocks": blocks, "notes": notes, "page_infos": page_infos,
+            "vlm_used": vlm_used_any,
+            "vlm_engine": vlm_engine_str if vlm_used_any else None,
+        }
+
+        yield sse_format(ProgressEvent(
+            stage="complete", message=f"Extraction complete: {len(doc)} pages, {len(blocks)} blocks",
+            page=total_pages, total_pages=total_pages, progress=1.0,
+            extra={"result": result},
+        ))
