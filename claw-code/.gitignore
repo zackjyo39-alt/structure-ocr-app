@@ -1,0 +1,3 @@
+# Local Claw state (sessions contain machine-specific paths)
+.claw/sessions/
+rust/.claw/sessions/
