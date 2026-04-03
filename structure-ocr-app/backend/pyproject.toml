@@ -17,9 +17,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 默认 OCR 引擎（Paddle）
 ocr = [
   "paddleocr>=3.4.0",
   "paddlex[serving]>=3.4.1",
+]
+# 轻量替代：RapidOCR ONNX（Mac/Linux 免 Paddle 框架）
+# STRUCTURE_OCR_ENGINE=rapidocr
+rapidocr = [
+  "rapidocr>=1.4.0",
+  "onnxruntime>=1.18.0",
+]
+# Apple Silicon 原生加速（macOS M 系列）
+# STRUCTURE_OCR_ENGINE=apple_vision
+apple-vision = [
+  "ocrmac>=0.3.0",
+]
+# 自动选最快可用引擎（apple_vision > rapidocr > paddle）
+# STRUCTURE_OCR_ENGINE=auto
+auto = [
+  "ocrmac>=0.3.0",
+  "rapidocr>=1.4.0",
+  "onnxruntime>=1.18.0",
 ]
 dev = [
   "httpx>=0.27.0",
@@ -35,3 +54,9 @@ include = [
   "README.md",
   "pyproject.toml",
 ]
+
+# ---------------------------------------------------------------------------
+# uv 配置：使用清华镜像源（国内下载大包更稳定）
+# ---------------------------------------------------------------------------
+[tool.uv]
+index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"

@@ -24,7 +24,6 @@ HANDOFF_DIR = AUTOMATION_DIR / "handoffs"
 INBOX_DIR = AUTOMATION_DIR / "inbox"
 RESULTS_DIR = AUTOMATION_DIR / "results"
 
-# Canonical tool result statuses after normalization (see normalize_result_status).
 NormalizedResult = Literal[
     "done",
     "blocked",
@@ -35,7 +34,6 @@ NormalizedResult = Literal[
     "unknown",
 ]
 
-# Outcome of one controller step (run-once / run-until-idle).
 RunOnceOutcome = Literal[
     "idle",
     "dispatched",
@@ -47,7 +45,6 @@ RunOnceOutcome = Literal[
 
 
 def normalize_result_status(payload: dict[str, Any]) -> NormalizedResult:
-    """Map tool result JSON to a canonical status string."""
     raw = payload.get("result")
     if raw is None:
         return "waiting"
@@ -68,13 +65,13 @@ def normalize_result_status(payload: dict[str, Any]) -> NormalizedResult:
         "time_out": "timeout",
     }
     key = synonyms.get(key, key)
-    if key in ("done", "blocked", "reassign", "waiting", "quota_exhausted", "timeout"):
+    if key in {"done", "blocked", "reassign", "waiting", "quota_exhausted", "timeout"}:
         return key
     return "unknown"
 
 
 def result_status_triggers_reassign(status: NormalizedResult) -> bool:
-    return status in ("blocked", "reassign", "quota_exhausted", "timeout")
+    return status in {"blocked", "reassign", "quota_exhausted", "timeout"}
 
 
 def now_stamp() -> str:
@@ -404,7 +401,6 @@ def command_reassign(ctx: ControllerContext, reason: str | None) -> int:
 
 
 def run_once_step(ctx: ControllerContext) -> RunOnceOutcome:
-    """Single controller iteration: collect+apply result, or select+dispatch. Mutates ctx."""
     tasks = ctx.tasks["tasks"]
     current = get_task_by_id(tasks, ctx.state.get("current_task_id"))
     if current and current.get("status") == "blocked":
@@ -429,23 +425,19 @@ def run_once_step(ctx: ControllerContext) -> RunOnceOutcome:
             reason = payload.get("summary", "tool requested reassignment")
             command_reassign(ctx, reason)
             return "reassigned"
-        if status in ("waiting", "unknown"):
-            reason = (
+        print(json.dumps({
+            "task": task["id"],
+            "tool": tool,
+            "action": "waiting",
+            "normalized": status,
+            "reason": (
                 "tool reports not finished"
                 if status == "waiting"
-                else f"unsupported or non-string result field: {payload.get('result')!r}"
-            )
-            print(json.dumps({
-                "task": task["id"],
-                "tool": tool,
-                "action": "waiting",
-                "normalized": status,
-                "reason": reason,
-            }, indent=2))
-            return "waiting"
-        raise AssertionError(f"unhandled normalized status: {status!r}")
+                else f"unsupported result value: {payload.get('result')!r}"
+            ),
+        }, indent=2))
+        return "waiting"
 
-    # One dispatch per in-flight task: if already in_progress but no result file, wait (avoid inbox spam).
     if current and current.get("status") == "in_progress":
         tool = ctx.state.get("current_tool") or choose_tool(current, ctx.routing)
         expected = RESULTS_DIR / tool / f"{current['id']}.json"
@@ -466,16 +458,14 @@ def run_once_step(ctx: ControllerContext) -> RunOnceOutcome:
     adapter = get_adapter(tool)
     packet_text = render_packet(task, tool, ctx.routing)
     inbox_dir = INBOX_DIR / tool
-    dispatch_result = adapter.dispatch(task["id"], packet_text, inbox_dir)
-    ctx.state["last_packet_path"] = (
-        str(dispatch_result.packet_path.relative_to(ROOT)) if dispatch_result.packet_path else None
-    )
+    result = adapter.dispatch(task["id"], packet_text, inbox_dir)
+    ctx.state["last_packet_path"] = str(result.packet_path.relative_to(ROOT)) if result.packet_path else None
     save_json(STATE_PATH, ctx.state)
     print(json.dumps({
         "action": "dispatched",
         "task": task["id"],
         "tool": tool,
-        "packet": str(dispatch_result.packet_path.relative_to(ROOT)) if dispatch_result.packet_path else None,
+        "packet": str(result.packet_path.relative_to(ROOT)) if result.packet_path else None,
     }, indent=2))
     return "dispatched"
 
@@ -518,8 +508,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("collect")
     subparsers.add_parser("complete")
     subparsers.add_parser("run-once")
-    rui = subparsers.add_parser("run-until-idle")
-    rui.add_argument("--max-steps", type=int, default=50, metavar="N", help="max controller iterations (default: 50)")
+    run_until_idle = subparsers.add_parser("run-until-idle")
+    run_until_idle.add_argument("--max-steps", type=int, default=50, metavar="N", help="max controller iterations (default: 50)")
     reassign = subparsers.add_parser("reassign")
     reassign.add_argument("--reason", required=False)
     handoff = subparsers.add_parser("handoff")

@@ -37,40 +37,32 @@ python3 automation/controller.py handoff --result done --summary "slice complete
 
 Runs the same step as `run-once` in a loop until one of these happens:
 
-- **Idle**: no queued work and nothing to dispatch (same `{"action": "idle", ...}` as `run-once`).
-- **Waiting**: the active tool result normalizes to `waiting` or `unknown` (still in progress or unsupported `result` value), **or** the task is already `in_progress` but the expected `automation/results/<tool>/<task-id>.json` is still missing (controller will not re-dispatch the same task until that file appears).
-- **Blocked state**: the task pointed to by `state.json` has `status: "blocked"` (needs a manual `handoff` or queue fix).
-- **Max steps**: default `50`; override with `--max-steps N` (must be >= 1).
+- **Idle**: no queued work and nothing to dispatch.
+- **Waiting**: the active tool result normalizes to `waiting` or `unknown`, or the task is already `in_progress` but the expected result JSON is still missing.
+- **Blocked state**: the task pointed to by `state.json` has `status: "blocked"`.
+- **Max steps**: default `50`; override with `--max-steps N`.
 
-The final line printed is a JSON summary, for example:
+The command prints one JSON event per step and ends with a summary like:
 
 ```bash
 python3 automation/controller.py run-until-idle --max-steps 10
-# ... one JSON event per step ...
-# {
-#   "action": "run_until_idle_finished",
-#   "steps": 3,
-#   "last_outcome": "idle",
-#   "max_steps": 10,
-#   "stopped_by_max_steps": false
-# }
 ```
 
 ### Result status normalization
 
-Tool result JSON uses a `result` string. The controller maps it to a canonical status (case-insensitive; hyphens and runs of spaces become underscores) before deciding what to do:
+Tool result JSON uses a `result` string. The controller maps it to a canonical status before deciding what to do:
 
-| Canonical status   | Behavior in `run-once` / `run-until-idle`      |
-|--------------------|-----------------------------------------------|
-| `done`             | Complete task (same as `complete`)            |
-| `blocked`          | Reassign to fallback tool                     |
-| `reassign`         | Reassign to fallback tool                     |
-| `quota_exhausted`  | Reassign to fallback tool                     |
-| `timeout`          | Reassign to fallback tool                     |
-| `waiting`          | No state change; loop stops for `run-until-idle` |
-| (missing / other) | Treated like `waiting` or `unknown` (no state change; loop stops) |
+| Canonical status | Behavior |
+| --- | --- |
+| `done` | Complete task |
+| `blocked` | Reassign to fallback tool |
+| `reassign` | Reassign to fallback tool |
+| `quota_exhausted` | Reassign to fallback tool |
+| `timeout` | Reassign to fallback tool |
+| `waiting` | No state change; loop stops |
+| `unknown` | No state change; loop stops |
 
-Synonyms include: `pending` / `in_progress` → `waiting`; `complete` / `completed` / `success` → `done`; `block` → `blocked`; `quota` → `quota_exhausted`; `timed_out` / `time_out` → `timeout`.
+Supported synonyms include `pending` / `in_progress` -> `waiting`, `complete` / `completed` / `success` -> `done`, `block` -> `blocked`, `quota` -> `quota_exhausted`, and `timed_out` / `time_out` -> `timeout`.
 
 ## Files
 
@@ -90,16 +82,16 @@ Synonyms include: `pending` / `in_progress` → `waiting`; `complete` / `complet
 4. `collect` reads the result payload.
 5. `complete` automatically writes handoff and marks the active task done.
 6. `reassign` automatically writes handoff and moves the active task to the fallback tool.
-7. `run-once` executes one controller loop (implemented by `run_once_step`):
+7. `run-once` executes one controller loop:
    - if there is a result JSON, it normalizes `result`, then auto-completes, reassigns, or waits
-   - else if the current task is already `in_progress`, it **waits** (one dispatch per task until a result file exists; avoids overwriting `inbox` in a tight loop)
-   - otherwise it selects and dispatches the next queued task
+   - if the current task is already `in_progress` but has no result JSON yet, it waits instead of re-dispatching
+   - otherwise it selects and dispatches the next task
 8. `run-until-idle` repeats that loop until idle, waiting/blocked-state stop, or `--max-steps`.
 
 `complete` and `reassign` are the preferred path once a tool has written a result JSON.
 Manual `handoff` remains available as a fallback for exceptional cases.
 
-`run-once` is the preferred operator entrypoint for a single step; `run-until-idle` is preferred when you want the controller to drain the queue until it must wait or stop.
+`run-once` is the preferred operator entrypoint for a single step. `run-until-idle` is preferred when you want the controller to drain work until it must wait or stop.
 
 ## OpenCode Entry
 
