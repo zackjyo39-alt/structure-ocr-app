@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import base64
 from dataclasses import dataclass, field
 
 
@@ -377,7 +378,10 @@ class DocumentExtractor:
             return self._structure
         try:
             os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-            from paddleocr import PPStructure
+            try:
+                from paddleocr import PPStructure
+            except ImportError:
+                from paddleocr import PPStructureV3 as PPStructure
 
             self._structure = PPStructure(lang="ch")
         except Exception:
@@ -401,7 +405,7 @@ class DocumentExtractor:
             except UnicodeDecodeError:
                 notes.append("Could not decode text file; returning raw bytes as text.")
                 text = raw.decode("utf-8", errors="replace")
-        return {"pages": 1, "text": text, "blocks": [{"page": 1, "type": "text", "text": text, "structure_type": "text", "reading_order": 0, "hierarchy_level": 4, "parent_id": None, "relations": [], "group_id": "single", "table_html": None}], "notes": notes, "page_infos": [{"page": 1, "width": None, "height": None, "columns": None, "layout_type": None}]}
+        return {"pages": 1, "text": text, "blocks": [{"page": 1, "type": "text", "text": text, "structure_type": "text", "reading_order": 0, "hierarchy_level": 4, "parent_id": None, "relations": [], "group_id": "single", "table_html": None}], "notes": notes, "page_infos": [{"page": 1, "width": None, "height": None, "image_data": None, "columns": None, "layout_type": None}]}
 
     def _extract_image(self, raw: bytes, notes: list[str]) -> dict:
         try:
@@ -411,45 +415,102 @@ class DocumentExtractor:
             return {"pages": 1, "text": "", "blocks": [], "notes": notes}
 
         try:
-            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            image_pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            buffered = io.BytesIO()
+            image_pil.save(buffered, format="PNG")
+            image_data = f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
         except Exception:
             notes.append("Could not open image file; the file may be corrupted or invalid.")
             return {"pages": 0, "text": "", "blocks": [], "notes": notes}
+            
         ocr = self._load_ocr()
+        structure = self._load_structure()
+        
+        if structure or ocr:
+            try:
+                import numpy as np
+                image = np.array(image_pil)[:, :, ::-1].copy()
+            except ImportError:
+                notes.append("Numpy is not installed; returning image metadata only.")
+                return {"pages": 1, "text": "", "blocks": [], "notes": notes, "page_infos": [{"page": 1, "width": float(image_pil.width), "height": float(image_pil.height), "image_data": image_data, "columns": None, "layout_type": None}]}
         blocks: list[dict] = []
         text = ""
+        w, h = image_pil.size
+        
+        if structure:
+            try:
+                structure_result = structure(image)
+                struct_blocks = _blocks_from_structure_result(
+                    1, structure_result, float(w), float(h)
+                )
+                if struct_blocks:
+                    _analyze_spatial_relations(struct_blocks, float(w), float(h))
+                    page_texts = [b["text"] for b in struct_blocks if b["text"]]
+                    return {
+                        "pages": 1,
+                        "text": "\n".join(page_texts),
+                        "blocks": struct_blocks,
+                        "notes": notes,
+                        "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
+                    }
+            except Exception as e:
+                notes.append(f"structure parse failed; fell back to OCR ({e})")
+
         if not ocr:
             notes.append("PaddleOCR is not installed; returning image metadata only.")
-            return {"pages": 1, "text": "", "blocks": blocks, "notes": notes}
-        result = ocr.ocr(image, cls=True)
-        page_text = []
-        for line in result[0] if result and len(result) > 0 else []:
-            bbox, (txt, score) = line
-            page_text.append(txt)
-            blocks.append(
-                {
-                    "page": 1,
-                    "type": "text",
-                    "structure_type": "text",
-                    "text": txt,
-                    "bbox": [float(v) for point in bbox for v in point],
-                    "confidence": float(score),
-                    "reading_order": len(page_text) - 1,
-                    "hierarchy_level": 4,
-                    "parent_id": None,
-                    "relations": [],
-                    "group_id": "single",
-                    "table_html": None,
-                }
-            )
-        text = "\n".join(page_text)
-        w, h = image.size
+            return {"pages": 1, "text": "", "blocks": blocks, "notes": notes, "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}]}
+            
+        try:
+            try:
+                result = ocr.ocr(image, cls=True)
+            except TypeError:
+                result = ocr.ocr(image)
+            extracted_lines = []
+            res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+            if isinstance(res_data, dict):
+                res_dict = res_data.get("res", res_data)
+                dt_polys = res_dict.get("dt_polys", [])
+                rec_texts = res_dict.get("rec_texts", res_dict.get("rec_text", []))
+                rec_scores = res_dict.get("rec_scores", res_dict.get("rec_score", []))
+                for i in range(len(dt_polys)):
+                    bbox = dt_polys[i]
+                    txt = rec_texts[i] if i < len(rec_texts) else ""
+                    score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
+                    extracted_lines.append((bbox, (txt, score)))
+            else:
+                extracted_lines = res_data if res_data else []
+
+            page_text = []
+            for line in extracted_lines:
+                bbox, (txt, score) = line
+                page_text.append(txt)
+                blocks.append(
+                    {
+                        "page": 1,
+                        "type": "text",
+                        "structure_type": "text",
+                        "text": txt,
+                        "bbox": [float(v) for point in bbox for v in point],
+                        "confidence": float(score),
+                        "reading_order": len(page_text) - 1,
+                        "hierarchy_level": 4,
+                        "parent_id": None,
+                        "relations": [],
+                        "group_id": "single",
+                        "table_html": None,
+                    }
+                )
+            text = "\n".join(page_text)
+        except Exception as exc:
+            notes.append(f"OCR failed ({exc})")
+            text = ""
+
         return {
             "pages": 1,
             "text": text,
             "blocks": blocks,
             "notes": notes,
-            "page_infos": [{"page": 1, "width": float(w), "height": float(h), "columns": None, "layout_type": None}],
+            "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
         }
 
     def _extract_pdf(self, raw: bytes, notes: list[str]) -> dict:
@@ -483,7 +544,15 @@ class DocumentExtractor:
                 continue
 
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            image_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            
+            if structure or ocr:
+                try:
+                    import numpy as np
+                    image = np.array(image_pil)[:, :, ::-1].copy()
+                except ImportError:
+                    notes.append(f"page {page_index}: Numpy is unavailable")
+                    continue
 
             if structure:
                 try:
@@ -505,10 +574,28 @@ class DocumentExtractor:
                 continue
 
             try:
-                result = ocr.ocr(image, cls=True)
+                try:
+                    result = ocr.ocr(image, cls=True)
+                except TypeError:
+                    result = ocr.ocr(image)
                 page_lines: list[str] = []
                 scores: list[float] = []
-                for line in result[0] if result and len(result) > 0 else []:
+                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
+                extracted_lines = []
+                if isinstance(res_data, dict):
+                    res_dict = res_data.get("res", res_data)
+                    dt_polys = res_dict.get("dt_polys", [])
+                    rec_texts = res_dict.get("rec_texts", res_dict.get("rec_text", []))
+                    rec_scores = res_dict.get("rec_scores", res_dict.get("rec_score", []))
+                    for i in range(len(dt_polys)):
+                        bbox = dt_polys[i]
+                        txt = rec_texts[i] if i < len(rec_texts) else ""
+                        score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
+                        extracted_lines.append((bbox, (txt, score)))
+                else:
+                    extracted_lines = res_data if res_data else []
+
+                for line in extracted_lines:
                     bbox, (txt, score) = line
                     page_lines.append(txt)
                     scores.append(float(score))
@@ -533,10 +620,13 @@ class DocumentExtractor:
         page_infos = []
         for page_index, page in enumerate(doc, start=1):
             rect = page.rect
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image_data = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode('utf-8')}"
             page_infos.append({
                 "page": page_index,
                 "width": rect.width,
                 "height": rect.height,
+                "image_data": image_data,
                 "columns": None,
                 "layout_type": None,
             })

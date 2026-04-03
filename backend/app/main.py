@@ -41,6 +41,7 @@ class PageInfo(BaseModel):
     page: int
     width: float | None = None
     height: float | None = None
+    image_data: str | None = None
     columns: int | None = None
     layout_type: str | None = None
 

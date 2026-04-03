@@ -8,10 +8,10 @@ PID_FRONTEND := $(RUN)/frontend.pid
 LOG_BACKEND := $(RUN)/backend.log
 LOG_FRONTEND := $(RUN)/frontend.log
 
-ifeq ($(wildcard $(ROOT)/.venv/bin/python3),)
+ifeq ($(wildcard $(BACKEND)/venv/bin/python3),)
   PYTHON := python3
 else
-  PYTHON := $(ROOT)/.venv/bin/python3
+  PYTHON := $(BACKEND)/venv/bin/python3
 endif
 
 .DEFAULT_GOAL := help

@@ -143,11 +143,12 @@ function StructureView({ blocks, pageInfos, highlightedBlockIndex, setHighlighte
     return () => ro.disconnect();
   }, []);
 
-  useEffect(() => {
+  const getPageScale = (pageW) => {
     if (canvasSize.w > 0 && pageW > 0) {
-      setScale(canvasSize.w / pageW);
+      return canvasSize.w / pageW;
     }
-  }, [canvasSize.w, pageW]);
+    return 1;
+  };
 
   const blocksWithBbox = blocks.filter(b => b.bbox && b.bbox.length >= 4);
   const blocksWithoutBbox = blocks.filter(b => !b.bbox || b.bbox.length < 4);
@@ -243,86 +244,117 @@ function StructureView({ blocks, pageInfos, highlightedBlockIndex, setHighlighte
       <div
         ref={canvasRef}
         style={{
-          position: "relative",
           width: "100%",
-          minHeight: pageH * scale,
-          background: "#ffffff",
-          borderRadius: 4,
-          overflow: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: 24,
         }}
       >
-        <div style={{ position: "relative", width: pageW, height: pageH }}>
-          {blocksWithBbox.map((block, idx) => {
-            const globalIdx = blocks.indexOf(block);
-            const isHighlighted = highlightedBlockIndex === globalIdx;
-            const r = bboxToRect(block.bbox);
-            if (!r) return null;
-            const left = r.minX;
-            const top = r.minY;
-            const w = r.maxX - r.minX;
-            const h = r.maxY - r.minY;
-            const fontSize = computeFontSize(block.bbox, block.hierarchy_level);
-            const color = getStructureColor(block);
+        {(pageInfos || []).map((page, pIdx) => {
+          const pageBlocks = blocksWithBbox.filter(b => b.page === page.page);
+          const pW = page.width || 1200;
+          const pH = page.height || 1600;
+          const pScale = getPageScale(pW);
 
-            if (block.table_html) {
-              return (
-                <div key={idx} style={{ position: "absolute", left, top, width: w, height: h, overflow: "hidden" }}>
-                  <div
-                    className="structure-table"
-                    style={{ background: "transparent" }}
-                    dangerouslySetInnerHTML={{ __html: block.table_html }}
-                  />
-                  <style>{`
-                    .structure-table table { width: 100%; border-collapse: collapse; font-size: ${Math.max(9, fontSize * 0.8)}px; }
-                    .structure-table th, .structure-table td { border: 1px solid #ccc; padding: 2px 4px; color: #1a1a1a; }
-                    .structure-table th { background: #e8e8e8; font-weight: 600; }
-                  `}</style>
-                </div>
-              );
-            }
-
-            return (
+          return (
+            <div
+              key={pIdx}
+              style={{
+                position: "relative",
+                width: "100%",
+                height: pH * pScale,
+                background: "#ffffff",
+                borderRadius: 4,
+                overflow: "hidden",
+                boxShadow: "0 0 10px rgba(0,0,0,0.2)",
+              }}
+            >
               <div
-                key={idx}
-                onMouseEnter={() => setHighlightedBlockIndex(globalIdx)}
-                onMouseLeave={() => setHighlightedBlockIndex(null)}
                 style={{
-                  position: "absolute",
-                  left,
-                  top,
-                  width: w,
-                  minHeight: h,
-                  padding: "1px 2px",
-                  background: isHighlighted ? hexToRgba(color, 0.15) : "transparent",
-                  border: isHighlighted ? `1px solid ${color}` : "1px solid transparent",
-                  borderRadius: 1,
-                  transition: "background 0.1s, border-color 0.1s",
-                  cursor: "pointer",
-                  overflow: "hidden",
+                  position: "relative",
+                  width: pW,
+                  height: pH,
+                  transform: `scale(${pScale})`,
+                  transformOrigin: "top left",
                 }}
               >
-                <div
-                  className="markdown-content"
-                  style={{
-                    fontSize,
-                    lineHeight: 1.3,
-                    color: "#1a1a1a",
-                    fontFamily: block.structure_type === "equation" ? "Georgia, serif" : "inherit",
-                    fontWeight: (block.hierarchy_level != null && block.hierarchy_level <= 1) ? 700 : (block.hierarchy_level === 2 ? 600 : 400),
-                    wordBreak: "break-word",
-                  }}
-                  dangerouslySetInnerHTML={{ __html: marked.parse(block.text || "") }}
-                />
+                {page.image_data && (
+                  <img
+                    src={page.image_data}
+                    alt={`Page ${page.page}`}
+                    style={{ position: "absolute", left: 0, top: 0, width: pW, height: pH }}
+                  />
+                )}
+                {pageBlocks.map((block, idx) => {
+                  const globalIdx = blocks.indexOf(block);
+                  const isHighlighted = highlightedBlockIndex === globalIdx;
+                  const r = bboxToRect(block.bbox);
+                  if (!r) return null;
+                  const left = r.minX;
+                  const top = r.minY;
+                  const w = r.maxX - r.minX;
+                  const h = r.maxY - r.minY;
+                  const fontSize = computeFontSize(block.bbox, block.hierarchy_level);
+                  const color = getStructureColor(block);
+
+                  if (block.table_html) {
+                    return (
+                      <div key={idx} style={{ position: "absolute", left, top, width: w, height: h, overflow: "hidden" }}>
+                        <div
+                          className="structure-table"
+                          style={{ background: "transparent" }}
+                          dangerouslySetInnerHTML={{ __html: block.table_html }}
+                        />
+                        <style>{`
+                          .structure-table table { width: 100%; border-collapse: collapse; font-size: ${Math.max(9, fontSize * 0.8)}px; }
+                          .structure-table th, .structure-table td { border: 1px solid #ccc; padding: 2px 4px; color: #1a1a1a; }
+                          .structure-table th { background: #e8e8e8; font-weight: 600; }
+                        `}</style>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div
+                      key={idx}
+                      onMouseEnter={() => setHighlightedBlockIndex(globalIdx)}
+                      onMouseLeave={() => setHighlightedBlockIndex(null)}
+                      style={{
+                        position: "absolute",
+                        left,
+                        top,
+                        width: w,
+                        minHeight: h,
+                        padding: "1px 2px",
+                        background: isHighlighted ? hexToRgba(color, 0.15) : "transparent",
+                        border: isHighlighted ? `1px solid ${color}` : "1px solid transparent",
+                        borderRadius: 1,
+                        transition: "background 0.1s, border-color 0.1s",
+                        cursor: "text",
+                        overflow: "hidden",
+                        color: "transparent",
+                      }}
+                    >
+                      <div
+                        className="markdown-content"
+                        style={{
+                          fontSize,
+                          lineHeight: 1.3,
+                          color: isHighlighted ? "#1a1a1a" : "transparent",
+                          fontFamily: block.structure_type === "equation" ? "Georgia, serif" : "inherit",
+                          fontWeight: (block.hierarchy_level != null && block.hierarchy_level <= 1) ? 700 : (block.hierarchy_level === 2 ? 600 : 400),
+                          wordBreak: "break-word",
+                          userSelect: "text",
+                        }}
+                        dangerouslySetInnerHTML={{ __html: marked.parse(block.text || "") }}
+                      />
+                    </div>
+                  );
+                })}
               </div>
-            );
-          })}
-          {blocksWithBbox.length === 0 && (
-            <div style={{ padding: 24, color: "#666", fontSize: 14, textAlign: "center" }}>
-              No blocks with bounding box coordinates available.
-              Structure reconstruction requires bbox data from OCR.
             </div>
-          )}
-        </div>
+          );
+        })}
       </div>
       {blocksWithoutBbox.length > 0 && (
         <div style={{ background: "#1c2128", borderRadius: 8, padding: 12 }}>
