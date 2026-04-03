@@ -1,5 +1,8 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
+import { marked } from "marked";
+
+marked.setOptions({ gfm: true, breaks: false });
 
 const API_BASE = "http://localhost:8000";
 const SUPPORTED_TYPES = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt"];
@@ -159,6 +162,73 @@ function StructureView({ blocks, pageInfos, highlightedBlockIndex, setHighlighte
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <style>{`
+        .markdown-content h1, .markdown-content h2, .markdown-content h3,
+        .markdown-content h4, .markdown-content h5, .markdown-content h6 {
+          margin: 0 0 4px 0;
+          font-weight: 700;
+          line-height: 1.2;
+        }
+        .markdown-content h1 { font-size: 1.4em; }
+        .markdown-content h2 { font-size: 1.2em; }
+        .markdown-content h3 { font-size: 1.1em; }
+        .markdown-content p { margin: 0 0 4px 0; }
+        .markdown-content ul, .markdown-content ol {
+          margin: 0;
+          padding-left: 16px;
+          list-style-position: inside;
+        }
+        .markdown-content li { margin: 2px 0; }
+        .markdown-content code {
+          background: #f0f0f0;
+          padding: 1px 3px;
+          border-radius: 2px;
+          font-family: ui-monospace, monospace;
+          font-size: 0.9em;
+        }
+        .markdown-content pre {
+          background: #f5f5f5;
+          padding: 6px;
+          border-radius: 3px;
+          overflow: auto;
+          font-size: 0.85em;
+        }
+        .markdown-content pre code {
+          background: transparent;
+          padding: 0;
+        }
+        .markdown-content blockquote {
+          margin: 4px 0;
+          padding-left: 8px;
+          border-left: 3px solid #ddd;
+          color: #555;
+        }
+        .markdown-content table {
+          width: 100%;
+          border-collapse: collapse;
+          margin: 4px 0;
+          font-size: 0.9em;
+        }
+        .markdown-content th, .markdown-content td {
+          border: 1px solid #ccc;
+          padding: 2px 4px;
+        }
+        .markdown-content th {
+          background: #e8e8e8;
+          font-weight: 600;
+        }
+        .markdown-content hr {
+          margin: 4px 0;
+          border: none;
+          border-top: 1px solid #ddd;
+        }
+        .markdown-content a {
+          color: #6366f1;
+          text-decoration: underline;
+        }
+        .markdown-content strong { font-weight: 700; }
+        .markdown-content em { font-style: italic; }
+      `}</style>
       <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#6b7280" }}>
         <span>Pixel-level reconstruction</span>
         <span>·</span>
@@ -231,17 +301,18 @@ function StructureView({ blocks, pageInfos, highlightedBlockIndex, setHighlighte
                   overflow: "hidden",
                 }}
               >
-                <span style={{
-                  fontSize,
-                  lineHeight: 1.3,
-                  color: "#1a1a1a",
-                  fontFamily: block.structure_type === "equation" ? "Georgia, serif" : "inherit",
-                  fontWeight: (block.hierarchy_level != null && block.hierarchy_level <= 1) ? 700 : (block.hierarchy_level === 2 ? 600 : 400),
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}>
-                  {block.text}
-                </span>
+                <div
+                  className="markdown-content"
+                  style={{
+                    fontSize,
+                    lineHeight: 1.3,
+                    color: "#1a1a1a",
+                    fontFamily: block.structure_type === "equation" ? "Georgia, serif" : "inherit",
+                    fontWeight: (block.hierarchy_level != null && block.hierarchy_level <= 1) ? 700 : (block.hierarchy_level === 2 ? 600 : 400),
+                    wordBreak: "break-word",
+                  }}
+                  dangerouslySetInnerHTML={{ __html: marked.parse(block.text || "") }}
+                />
               </div>
             );
           })}
@@ -404,9 +475,11 @@ function UploadCanvas({
 
   const measureImage = useCallback(() => {
     const img = imageRef.current;
-    if (!img?.naturalWidth) return;
+    if (!img?.complete || !img?.naturalWidth) return;
     const r = img.getBoundingClientRect();
-    setImgDisplay({ w: r.width, h: r.height });
+    if (r.width > 0 && r.height > 0) {
+      setImgDisplay({ w: r.width, h: r.height });
+    }
   }, []);
 
   useEffect(() => {
@@ -418,7 +491,7 @@ function UploadCanvas({
       window.removeEventListener("resize", measureImage);
       ro.disconnect();
     };
-  }, [measureImage, preview, file]);
+  }, [measureImage]);
 
   const handleDrop = useCallback((e) => {
     e.preventDefault();
@@ -466,7 +539,9 @@ function UploadCanvas({
   const handleImageMouseMove = (e) => {
     if (!blocks?.length || !imageRef.current) return;
     const img = imageRef.current;
+    if (!img.complete || !img.naturalWidth) return;
     const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
     const scaleX = img.naturalWidth / rect.width;
     const scaleY = img.naturalHeight / rect.height;
     const x = (e.clientX - rect.left) * scaleX;
@@ -569,9 +644,7 @@ function UploadCanvas({
             {isImage && preview && (
               <div
                 ref={imgWrapRef}
-                style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}
-                onMouseMove={handleImageMouseMove}
-                onMouseLeave={handleImageMouseLeave}
+                style={{ position: "relative", display: "inline-block", maxWidth: "100%", maxHeight: "calc(100vh - 200px)", overflow: "auto" }}
               >
                 <img
                   ref={imageRef}
@@ -579,15 +652,18 @@ function UploadCanvas({
                   alt="preview"
                   style={{ maxWidth: "100%", height: "auto", display: "block", cursor: "crosshair" }}
                   onLoad={measureImage}
+                  onMouseMove={handleImageMouseMove}
+                  onMouseLeave={handleImageMouseLeave}
                 />
-                {blocks?.length > 0 && imageRef.current?.naturalWidth > 0 && (
+                {blocks?.length > 0 && imgDisplay.w > 0 && imgDisplay.h > 0 && (
                   <BboxOverlay
                     blocks={blocks}
-                    naturalW={imageRef.current.naturalWidth}
-                    naturalH={imageRef.current.naturalHeight}
+                    naturalW={imageRef.current?.naturalWidth || 1}
+                    naturalH={imageRef.current?.naturalHeight || 1}
                     highlightedBlockIndex={highlightedBlockIndex}
                     displayW={imgDisplay.w}
                     displayH={imgDisplay.h}
+                    pageNum={null}
                   />
                 )}
               </div>
@@ -941,10 +1017,19 @@ function App() {
     formData.append("file", file);
     try {
       const res = await fetch(`${API_BASE}/api/extract`, { method: "POST", body: formData });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`HTTP ${res.status}: ${errorText}`);
+      }
       setResult(await res.json());
     } catch (err) {
-      setError(String(err.message || err));
+      const errorMessage = err.message || String(err);
+      if (errorMessage.includes("Failed to fetch") || err instanceof TypeError) {
+        setError(`无法连接后端服务 (${API_BASE})。请确保后端服务已启动：
+          cd backend && uvicorn app.main:app --reload --port 8000`);
+      } else {
+        setError(errorMessage);
+      }
     } finally {
       setLoading(false);
     }
