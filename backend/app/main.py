@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import base64
 import urllib.request
@@ -27,6 +28,11 @@ app.add_middleware(
 
 extractor = DocumentExtractor()
 SUPPORTED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt"}
+
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "100"))
+OCR_TIMEOUT_SECONDS = float(os.environ.get("OCR_TIMEOUT_SECONDS", "60.0"))
+VLM_TIMEOUT_SECONDS = float(os.environ.get("VLM_TIMEOUT_SECONDS", "120.0"))
 
 
 class PageBlock(BaseModel):
@@ -252,12 +258,33 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
+    file_size_mb = len(raw) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {file_size_mb:.1f}MB exceeds maximum {MAX_FILE_SIZE_MB}MB",
+        )
+
     suffix = Path(file.filename or "upload").suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
         raise HTTPException(
             status_code=400,
             detail=f"unsupported file type '{suffix}'; supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}",
         )
+
+    if suffix == ".pdf" and MAX_PDF_PAGES > 0:
+        try:
+            import fitz
+            doc = fitz.open(stream=raw, filetype="pdf")
+            page_count = len(doc)
+            doc.close()
+            if page_count > MAX_PDF_PAGES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"PDF has {page_count} pages, exceeds maximum {MAX_PDF_PAGES} pages",
+                )
+        except Exception:
+            pass
 
     checksum = hashlib.sha256(raw).hexdigest()
     mime_type = file.content_type or "application/octet-stream"

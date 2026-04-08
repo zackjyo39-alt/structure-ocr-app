@@ -6,8 +6,60 @@ import logging
 import os
 import re
 import base64
+import time
+import functools
 from dataclasses import dataclass, field
-from typing import Generator
+from typing import Generator, Callable, Any
+
+
+# ---------------------------------------------------------------------------
+# Retry Configuration and Error Handling
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    initial_backoff: float = 0.5
+    max_backoff: float = 10.0
+    backoff_multiplier: float = 2.0
+    timeout: float = 30.0
+
+
+class ResourceLimitError(Exception):
+    pass
+
+
+def with_retry(config: RetryConfig | None = None):
+    if config is None:
+        config = RetryConfig()
+    
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            last_exception = None
+            backoff = config.initial_backoff
+            
+            for attempt in range(config.max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except ResourceLimitError:
+                    raise
+                except Exception as e:
+                    last_exception = e
+                    if attempt < config.max_retries:
+                        _logger.warning(
+                            "Retry attempt %d/%d for %s after error: %s",
+                            attempt + 1, config.max_retries, func.__name__, e
+                        )
+                        time.sleep(backoff)
+                        backoff = min(backoff * config.backoff_multiplier, config.max_backoff)
+                    else:
+                        _logger.error("All retries exhausted for %s: %s", func.__name__, e)
+            
+            raise last_exception if last_exception else Exception("Unknown error")
+        
+        return wrapper
+    return decorator
 
 
 # ---------------------------------------------------------------------------

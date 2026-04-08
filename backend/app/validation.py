@@ -21,6 +21,67 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# File validation exceptions and functions
+# ---------------------------------------------------------------------------
+
+class FileValidationError(Exception):
+    """Raised when file validation fails."""
+    pass
+
+
+# Magic bytes for common file types
+_FILE_MAGIC_BYTES: dict[str, tuple[bytes, str]] = {
+    "application/pdf": (b"%PDF", "PDF document"),
+    "image/png": (b"\x89PNG\r\n\x1a\n", "PNG image"),
+    "image/jpeg": (b"\xFF\xD8\xFF", "JPEG image"),
+    "image/webp": (b"RIFF", "WebP image"),
+}
+
+
+def validate_file_magic_bytes(data: bytes, expected_mime: str) -> bool:
+    """Check file magic bytes against expected MIME type."""
+    if expected_mime not in _FILE_MAGIC_BYTES:
+        raise FileValidationError(f"Unsupported MIME type: {expected_mime}")
+    
+    magic, description = _FILE_MAGIC_BYTES[expected_mime]
+    
+    if expected_mime == "image/webp":
+        if len(data) >= 12 and data[:4] == magic and data[8:12] == b"WEBP":
+            return True
+        raise FileValidationError(f"Not a valid WebP file")
+    
+    if not data.startswith(magic):
+        raise FileValidationError(f"Not a valid {description}")
+    
+    return True
+
+
+def validate_file_content(file_data: bytes, filename: str) -> dict:
+    """Validate file based on extension and magic bytes."""
+    suffix = filename.lower().split(".")[-1] if "." in filename else ""
+    
+    mime_map = {
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }
+    
+    if suffix not in mime_map:
+        return {"valid": False, "mime_type": "", "error": f"Unsupported file type: {suffix}"}
+    
+    expected_mime = mime_map[suffix]
+    
+    try:
+        validate_file_magic_bytes(file_data, expected_mime)
+        return {"valid": True, "mime_type": expected_mime, "error": ""}
+    except FileValidationError as e:
+        return {"valid": False, "mime_type": expected_mime, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Legal field regex patterns
 # ---------------------------------------------------------------------------
@@ -397,5 +458,90 @@ def _jaccard_bigram_similarity(s1: str, s2: str) -> float:
 
     intersection = b1 & b2
     union = b1 | b2
+    return len(intersection) / len(union) if union else 0.0
+
+
+def detect_conflicts(blocks: list[dict]) -> list[dict]:
+    """Detect conflicts within extracted blocks."""
+    conflicts = []
+    
+    case_numbers = []
+    amounts = []
+    
+    for idx, block in enumerate(blocks):
+        text = block.get("text", "")
+        
+        for m in _CASE_NUMBER_RE.finditer(text):
+            case_num = _normalize_case_number(m.group(0))
+            case_numbers.append({
+                "index": idx,
+                "value": m.group(0),
+                "normalized": case_num,
+            })
+        
+        for m in _AMOUNT_YUAN_RE.finditer(text):
+            try:
+                val = float(m.group(1).replace(",", ""))
+                amounts.append({
+                    "index": idx,
+                    "value": m.group(0),
+                    "numeric": val,
+                })
+            except ValueError:
+                pass
+    
+    seen_cases = {}
+    for cn in case_numbers:
+        norm = cn["normalized"]
+        if norm in seen_cases:
+            conflicts.append({
+                "type": "duplicate_case_number",
+                "locations": [seen_cases[norm]["index"], cn["index"]],
+                "values": [seen_cases[norm]["value"], cn["value"]],
+                "severity": "high",
+            })
+        else:
+            seen_cases[norm] = cn
+    
+    seen_amounts = {}
+    for amt in amounts:
+        key = f"{amt['numeric']:.2f}"
+        if key in seen_amounts:
+            if seen_amounts[key]["value"] != amt["value"]:
+                conflicts.append({
+                    "type": "conflicting_amount",
+                    "locations": [seen_amounts[key]["index"], amt["index"]],
+                    "values": [seen_amounts[key]["value"], amt["value"]],
+                    "severity": "medium",
+                })
+        else:
+            seen_amounts[key] = amt
+    
+    return conflicts
+
+
+def compute_document_consistency_score(blocks: list[dict]) -> dict:
+    """Aggregate per-block consistency to document level."""
+    total = len(blocks)
+    if total == 0:
+        return {"overall_score": 1.0, "block_count": 0, "low_confidence_count": 0, "conflicts_found": 0}
+    
+    low_conf = sum(1 for b in blocks if (b.get("confidence", 0.85) or 0.85) < 0.6)
+    conflicts = detect_conflicts(blocks)
+    
+    confidence_sum = sum(b.get("confidence", 0.85) or 0.85 for b in blocks)
+    avg_conf = confidence_sum / total
+    
+    conflict_penalty = len([c for c in conflicts if c["severity"] == "high"]) * 0.1
+    conflict_penalty += len([c for c in conflicts if c["severity"] == "medium"]) * 0.05
+    
+    overall = max(0.0, min(1.0, avg_conf - conflict_penalty))
+    
+    return {
+        "overall_score": round(overall, 4),
+        "block_count": total,
+        "low_confidence_count": low_conf,
+        "conflicts_found": len(conflicts),
+    }
 
     return len(intersection) / len(union)
