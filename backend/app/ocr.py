@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import base64
@@ -44,6 +45,552 @@ def sse_format(event: ProgressEvent) -> str:
     """Format a ProgressEvent as an SSE message line."""
     data = json.dumps(event.to_dict(), ensure_ascii=False)
     return f"event: {event.stage}\ndata: {data}\n\n"
+
+
+def _legal_diff_for_vlm_page(vlm_blocks: list, ocr_text: str | None, page: int) -> dict:
+    from app.validation import compute_legal_field_diffs_for_page
+
+    vlm_text = "\n".join(el.get("text", "") for el in vlm_blocks)
+    return compute_legal_field_diffs_for_page(vlm_text, ocr_text, page)
+
+
+# ---------------------------------------------------------------------------
+# PaddleOCR performance (Mac M1 等通常为 CPU 推理，默认偏质量；可用环境变量加速)
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger(__name__)
+
+
+def _configure_paddle_device() -> None:
+    """在 **装有 NVIDIA CUDA** 的环境用 GPU 跑 Paddle（需 paddlepaddle-gpu）。
+
+    设置环境变量 ``STRUCTURE_OCR_PADDLE_DEVICE=gpu:0``（或 ``gpu:1``）。
+    **Apple Silicon Mac 上 pip 版 Paddle 一般没有 CUDA，设了会报错或无效**，请留空走 CPU。
+
+    文档: https://www.paddlepaddle.org.cn/install/quick
+    """
+    dev = (os.environ.get("STRUCTURE_OCR_PADDLE_DEVICE") or "").strip()
+    if not dev:
+        return
+    try:
+        import paddle
+
+        paddle.device.set_device(dev)
+        _logger.info("Paddle device set to %s (STRUCTURE_OCR_PADDLE_DEVICE)", dev)
+    except Exception as e:
+        _logger.warning(
+            "STRUCTURE_OCR_PADDLE_DEVICE=%r ignored: %s — falling back to Paddle default device",
+            dev,
+            e,
+        )
+
+
+def _env_truthy(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_opt_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _env_opt_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _ocr_fast_mode() -> bool:
+    return _env_truthy("STRUCTURE_OCR_FAST", False)
+
+
+def _pdf_pixmap_matrix(fitz_mod):
+    """PDF 栅格倍率：默认 2.0；降到 1.25～1.5 可明显加速 OCR（略损小字）。"""
+    z = _env_opt_float("STRUCTURE_OCR_PDF_ZOOM", 2.0)
+    return fitz_mod.Matrix(z, z) if z > 0 else fitz_mod.Matrix(2, 2)
+
+
+def _paddle_ocr_init_kwargs() -> dict:
+    """PaddleOCR 3.x 构造参数。STRUCTURE_OCR_FAST=1：关行方向 + 缩短检测边。"""
+    fast = _ocr_fast_mode()
+    raw_orient = os.environ.get("STRUCTURE_OCR_TEXTLINE_ORIENTATION")
+    if raw_orient is not None:
+        use_textline_orientation = _env_truthy("STRUCTURE_OCR_TEXTLINE_ORIENTATION", True)
+    else:
+        use_textline_orientation = not fast
+
+    kw: dict = {"lang": "ch", "use_textline_orientation": use_textline_orientation}
+
+    det = _env_opt_int("STRUCTURE_OCR_DET_LIMIT_SIDE_LEN")
+    if det is not None:
+        kw["text_det_limit_side_len"] = max(320, det)
+    elif fast:
+        kw["text_det_limit_side_len"] = 736
+
+    rb = _env_opt_int("STRUCTURE_OCR_REC_BATCH_SIZE")
+    if rb is not None and rb > 0:
+        kw["text_recognition_batch_size"] = rb
+
+    return kw
+
+
+def _paddle_ocr_predict(ocr, image_np):
+    """PaddleOCR 3.x：使用 predict（勿传已废弃的 cls=）。"""
+    kw = {}
+    det = _env_opt_int("STRUCTURE_OCR_PREDICT_DET_LIMIT_SIDE_LEN")
+    if det is not None:
+        kw["text_det_limit_side_len"] = max(320, det)
+    if _env_truthy("STRUCTURE_OCR_PREDICT_NO_ORIENTATION", False):
+        kw["use_textline_orientation"] = False
+    if kw:
+        return ocr.predict(image_np, **kw)
+    return ocr.predict(image_np)
+
+
+# ---------------------------------------------------------------------------
+# Multi-engine OCR support
+# STRUCTURE_OCR_ENGINE=paddle (default) | rapidocr | apple_vision | auto
+#                      | cross_validate
+# Cross-validation: STRUCTURE_OCR_CV_PRIMARY=apple_vision (default)
+#                   STRUCTURE_OCR_CV_SECONDARY=rapidocr   (default)
+# ---------------------------------------------------------------------------
+
+_VALID_ENGINES = ("paddle", "rapidocr", "apple_vision", "auto", "cross_validate")
+
+def _get_ocr_engine_name() -> str:
+    """Read STRUCTURE_OCR_ENGINE env var; default to 'paddle'."""
+    v = os.environ.get("STRUCTURE_OCR_ENGINE", "").strip().lower()
+    if v in _VALID_ENGINES:
+        return v
+    if v:
+        _logger.warning("Unknown STRUCTURE_OCR_ENGINE=%r, falling back to 'paddle'", v)
+    return "paddle"
+
+
+def _rapidocr_seq(attr):
+    """Normalize RapidOCR list fields (often numpy) — never use `x or []` on ndarrays."""
+    if attr is None:
+        return []
+    if hasattr(attr, "tolist") and not isinstance(attr, (list, tuple)):
+        return attr.tolist()
+    return list(attr)
+
+
+def _rapidocr_raw_list(result) -> list:
+    """Convert RapidOCR result → [[bbox_polygon, (text, score)], ...] for _reconstruct_layout."""
+    if result is None:
+        return []
+    boxes = _rapidocr_seq(getattr(result, "boxes", None))
+    txts = _rapidocr_seq(getattr(result, "txts", None))
+    scores = _rapidocr_seq(getattr(result, "scores", None))
+    rows = []
+    for i, bbox in enumerate(boxes):
+        txt = txts[i] if i < len(txts) else ""
+        score = float(scores[i]) if i < len(scores) else 0.5
+        rows.append([bbox, (txt, score)])
+    return rows
+
+
+def _apple_vision_raw_list(ocr_items, img_w: int, img_h: int) -> list:
+    """Convert ocrmac result → [[bbox_polygon, (text, score)], ...] for _reconstruct_layout.
+
+    ocrmac returns: [(text, confidence, [x_norm, y_bl_norm, w_norm, h_norm]), ...]
+    Apple Vision uses bottom-left origin; we flip to top-left.
+    """
+    if not ocr_items:
+        return []
+    rows = []
+    for item in ocr_items:
+        if len(item) < 3:
+            continue
+        text, conf, box = str(item[0]), float(item[1]), item[2]
+        if len(box) < 4:
+            continue
+        x_n, y_bl, w_n, h_n = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        # Flip y-axis: Apple Vision y=0 is bottom; screen y=0 is top
+        x1 = x_n * img_w
+        y1 = (1.0 - y_bl - h_n) * img_h
+        x2 = x1 + w_n * img_w
+        y2 = y1 + h_n * img_h
+        bbox_polygon = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        rows.append([bbox_polygon, (text, conf)])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Cross-Validation helpers
+# ---------------------------------------------------------------------------
+
+def _poly_bounds(bbox: list) -> tuple[float, float, float, float]:
+    """Return (x1, y1, x2, y2) axis-aligned bounds of a polygon."""
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bbox_iou(a: list | None, b: list | None) -> float:
+    """IoU between two bbox polygons; returns 0 if either is None/empty."""
+    if not a or not b:
+        return 0.0
+    ax1, ay1, ax2, ay2 = _poly_bounds(a)
+    bx1, by1, bx2, by2 = _poly_bounds(b)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = max((ax2 - ax1) * (ay2 - ay1), 1e-6)
+    area_b = max((bx2 - bx1) * (by2 - by1), 1e-6)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _text_sim_cv(a: str, b: str) -> float:
+    """Character-bigram Jaccard similarity; ignores spaces for CJK robustness."""
+    a, b = (a or "").strip(), (b or "").strip()
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    ca, cb = a.replace(" ", ""), b.replace(" ", "")
+    # Exact match after space removal
+    if ca == cb:
+        return 1.0
+    # Single-character strings: exact or nothing
+    if len(ca) <= 1 or len(cb) <= 1:
+        return 1.0 if ca == cb else 0.0
+    bg_a = {ca[i : i + 2] for i in range(len(ca) - 1)}
+    bg_b = {cb[i : i + 2] for i in range(len(cb) - 1)}
+    inter = len(bg_a & bg_b)
+    union = len(bg_a | bg_b)
+    return inter / union if union > 0 else 0.0
+
+
+# IoU threshold: blocks with overlap >= this are considered "same region"
+_CV_IOU_THRESHOLD: float = float(os.environ.get("STRUCTURE_OCR_CV_IOU_THRESHOLD", "0.35"))
+# Text similarity threshold: >= this → "match"; below → "mismatch"
+_CV_TEXT_MATCH_THRESHOLD: float = float(
+    os.environ.get("STRUCTURE_OCR_CV_TEXT_THRESHOLD", "0.80")
+)
+# On mismatch: "primary" (default) keeps primary block text; "secondary" uses secondary OCR text in the block + merged fulltext
+_CV_ON_MISMATCH: str = os.environ.get("STRUCTURE_OCR_CV_ON_MISMATCH", "primary").strip().lower()
+
+
+def _merge_cross_validate(
+    blocks_a: list,
+    text_a: str,
+    blocks_b: list,
+    text_b: str,
+    primary_label: str = "engine_a",
+    secondary_label: str = "engine_b",
+) -> tuple[list, str]:
+    """Align two OCR block lists by IoU and annotate each with cross-validation status.
+
+    Returns (annotated_blocks, merged_fulltext) — fulltext 由最终块 spatial 拼接，含仅副引擎检出行。
+    Each block gains a 'cross_validation' sub-dict:
+        {
+          "status": "match" | "mismatch" | "primary_only" | "secondary_only",
+          "primary_text": str | None,
+          "secondary_text": str | None,
+          "similarity": float,       # bigram Jaccard
+          "iou": float,
+          "primary_engine": str,
+          "secondary_engine": str,
+        }
+    Confidence (score) is boosted for matches, reduced for mismatches.
+    """
+    used_b: set[int] = set()
+    annotated: list[dict] = []
+
+    for blk_a in blocks_a:
+        bbox_a = blk_a.get("bbox")
+        best_j, best_iou = -1, 0.0
+
+        for j, blk_b in enumerate(blocks_b):
+            if j in used_b:
+                continue
+            iou = _bbox_iou(bbox_a, blk_b.get("bbox"))
+            if iou > best_iou:
+                best_iou, best_j = iou, j
+
+        blk_out = dict(blk_a)
+        if best_iou >= _CV_IOU_THRESHOLD and best_j >= 0:
+            blk_b = blocks_b[best_j]
+            used_b.add(best_j)
+            sim = _text_sim_cv(blk_a.get("text", ""), blk_b.get("text", ""))
+            status = "match" if sim >= _CV_TEXT_MATCH_THRESHOLD else "mismatch"
+            # Adjust confidence: boost on match, penalise on mismatch
+            score_a = blk_a.get("score", 0.5)
+            score_b = blk_b.get("score", 0.5)
+            if status == "match":
+                blk_out["score"] = min(1.0, (score_a + score_b) / 2 + 0.12)
+            else:
+                blk_out["score"] = max(0.1, min(score_a, score_b) - 0.12)
+                if _CV_ON_MISMATCH == "secondary":
+                    st = (blk_b.get("text") or "").strip()
+                    if st:
+                        blk_out["text"] = blk_b.get("text", "")
+            blk_out["cross_validation"] = {
+                "status": status,
+                "primary_text": blk_a.get("text"),
+                "secondary_text": blk_b.get("text"),
+                "similarity": round(sim, 3),
+                "iou": round(best_iou, 3),
+                "primary_engine": primary_label,
+                "secondary_engine": secondary_label,
+            }
+        else:
+            # No matching block in secondary → uncertain
+            blk_out["score"] = max(0.1, blk_a.get("score", 0.5) - 0.15)
+            blk_out["cross_validation"] = {
+                "status": "primary_only",
+                "primary_text": blk_a.get("text"),
+                "secondary_text": None,
+                "similarity": 0.0,
+                "iou": 0.0,
+                "primary_engine": primary_label,
+                "secondary_engine": secondary_label,
+            }
+        annotated.append(blk_out)
+
+    # Blocks only seen by secondary → append as uncertain
+    for j, blk_b in enumerate(blocks_b):
+        if j not in used_b:
+            blk_out = dict(blk_b)
+            blk_out["score"] = max(0.1, blk_b.get("score", 0.5) - 0.15)
+            blk_out["cross_validation"] = {
+                "status": "secondary_only",
+                "primary_text": None,
+                "secondary_text": blk_b.get("text"),
+                "similarity": 0.0,
+                "iou": 0.0,
+                "primary_engine": primary_label,
+                "secondary_engine": secondary_label,
+            }
+            annotated.append(blk_out)
+
+    # Re-sort by vertical position (primary_only / secondary_only may be interleaved)
+    annotated.sort(key=lambda b: b.get("center_y", 0))
+    # Full OCR string from final blocks (includes secondary_only lines; matches block text after mismatch override)
+    raw_lines: list = []
+    for b in annotated:
+        bb = b.get("bbox")
+        if bb:
+            raw_lines.append([bb, (b.get("text") or "", float(b.get("score", 0.5)))])
+    _, merged_full = _reconstruct_layout(raw_lines)
+    return annotated, merged_full
+
+
+def compute_cross_validation_summary(blocks: list[dict]) -> dict | None:
+    """Aggregate per-block cross_validation fields into a page/doc summary."""
+    cv_blocks = [b for b in blocks if b.get("cross_validation")]
+    if not cv_blocks:
+        return None
+
+    counts: dict[str, int] = {"match": 0, "mismatch": 0, "primary_only": 0, "secondary_only": 0}
+    mismatches: list[dict] = []
+
+    for b in cv_blocks:
+        cv = b["cross_validation"]
+        st = cv.get("status", "unknown")
+        counts[st] = counts.get(st, 0) + 1
+        if st == "mismatch":
+            mismatches.append({
+                "primary_text": cv.get("primary_text"),
+                "secondary_text": cv.get("secondary_text"),
+                "similarity": cv.get("similarity"),
+                "bbox": b.get("bbox"),
+                "page": b.get("page", 1),
+            })
+
+    total = len(cv_blocks)
+    matched = counts["match"]
+    agreement_rate = round(matched / total, 3) if total else 1.0
+
+    primary_engine = cv_blocks[0]["cross_validation"].get("primary_engine", "?")
+    secondary_engine = cv_blocks[0]["cross_validation"].get("secondary_engine", "?")
+
+    return {
+        "primary_engine": primary_engine,
+        "secondary_engine": secondary_engine,
+        "total_blocks": total,
+        "matched": matched,
+        "mismatched": counts["mismatch"],
+        "primary_only": counts["primary_only"],
+        "secondary_only": counts["secondary_only"],
+        "agreement_rate": agreement_rate,
+        "mismatches": mismatches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Engine wrapper and builder
+# ---------------------------------------------------------------------------
+
+class _OcrEngineWrapper:
+    """Unified OCR engine interface.
+
+    Wraps PaddleOCR / RapidOCR / Apple Vision so every call site can use:
+        extracted_blocks, ocr_text = ocr.predict(image_np, image_pil)
+    """
+
+    def __init__(self, engine_type: str, engine_obj) -> None:
+        self.engine_type = engine_type
+        self._engine = engine_obj
+
+    def predict(self, image_np, image_pil=None) -> tuple[list, str]:
+        """Run OCR and return (extracted_blocks, ocr_text) via _reconstruct_layout."""
+        try:
+            raw = self._raw_predict(image_np, image_pil)
+        except Exception as e:
+            _logger.error("OCR engine '%s' prediction failed: %s", self.engine_type, e)
+            return [], ""
+        return _reconstruct_layout(raw)
+
+    def _raw_predict(self, image_np, image_pil):
+        if self.engine_type == "paddle":
+            result = _paddle_ocr_predict(self._engine, image_np)
+            # PaddleOCR 3.x returns a list of per-image results
+            return (
+                result[0]
+                if result and isinstance(result, (list, tuple)) and len(result) > 0
+                else result
+            )
+
+        if self.engine_type == "rapidocr":
+            result = self._engine(image_np)
+            return _rapidocr_raw_list(result)
+
+        if self.engine_type == "apple_vision":
+            if image_pil is None:
+                from PIL import Image
+                image_pil = Image.fromarray(image_np[:, :, ::-1])
+            # ocrmac>=1.0: use text_from_image (module no longer exposes ocrmac.OCR)
+            items = self._engine(image_pil, detail=True)
+            return _apple_vision_raw_list(items, image_pil.width, image_pil.height)
+
+        return []
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class _CrossValidateWrapper:
+    """Run two OCR engines on the same image and cross-validate their outputs.
+
+    Blocks are aligned by bounding-box IoU; text similarity determines match/mismatch.
+    Matched blocks get a confidence boost; mismatched blocks are flagged for review.
+    """
+
+    def __init__(self, primary: _OcrEngineWrapper, secondary: _OcrEngineWrapper) -> None:
+        self.primary = primary
+        self.secondary = secondary
+        self.engine_type = f"cross_validate({primary.engine_type}+{secondary.engine_type})"
+
+    def predict(self, image_np, image_pil=None) -> tuple[list, str]:
+        blocks_a, text_a = self.primary.predict(image_np, image_pil)
+        blocks_b, text_b = self.secondary.predict(image_np, image_pil)
+        return _merge_cross_validate(
+            blocks_a, text_a,
+            blocks_b, text_b,
+            self.primary.engine_type,
+            self.secondary.engine_type,
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.primary) or bool(self.secondary)
+
+
+def _build_single_engine_by_name(name: str) -> "_OcrEngineWrapper | bool":
+    """Build one named leaf engine (not 'auto' or 'cross_validate')."""
+    if name == "apple_vision":
+        try:
+            from ocrmac.ocrmac import text_from_image  # type: ignore
+            _logger.info("OCR engine: Apple Vision (ocrmac text_from_image)")
+            return _OcrEngineWrapper("apple_vision", text_from_image)
+        except ImportError:
+            _logger.error(
+                "apple_vision engine requested but ocrmac is not installed: pip install ocrmac"
+            )
+            return False
+
+    if name == "rapidocr":
+        try:
+            from rapidocr import RapidOCR  # type: ignore
+            _logger.info("OCR engine: RapidOCR (ONNX)")
+            return _OcrEngineWrapper("rapidocr", RapidOCR())
+        except ImportError:
+            _logger.error(
+                "rapidocr engine requested but not installed: pip install rapidocr onnxruntime"
+            )
+            return False
+
+    # paddle (default)
+    try:
+        os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        _configure_paddle_device()
+        from paddleocr import PaddleOCR
+
+        engine = PaddleOCR(**_paddle_ocr_init_kwargs())
+        _logger.info("OCR engine: PaddleOCR")
+        return _OcrEngineWrapper("paddle", engine)
+    except Exception as e:
+        _logger.error("Failed to load PaddleOCR: %s", e)
+        return False
+
+
+def _build_ocr_engine_wrapper() -> "_OcrEngineWrapper | _CrossValidateWrapper | bool":
+    """Load the OCR engine configured by STRUCTURE_OCR_ENGINE; returns wrapper or False."""
+    name = _get_ocr_engine_name()
+
+    # ── cross_validate: run two engines and compare ──────────────────────────
+    if name == "cross_validate":
+        primary_name = os.environ.get("STRUCTURE_OCR_CV_PRIMARY", "rapidocr").strip().lower()
+        secondary_name = os.environ.get("STRUCTURE_OCR_CV_SECONDARY", "apple_vision").strip().lower()
+        _logger.info(
+            "OCR mode: cross_validate  primary=%s  secondary=%s",
+            primary_name, secondary_name,
+        )
+        primary = _build_single_engine_by_name(primary_name)
+        secondary = _build_single_engine_by_name(secondary_name)
+        if primary and secondary:
+            return _CrossValidateWrapper(primary, secondary)  # type: ignore[arg-type]
+        if primary or secondary:
+            _logger.warning(
+                "Cross-validation: only one engine loaded (%s), running single-engine mode. "
+                "Install the other with: pip install '.[auto]'",
+                primary_name if primary else secondary_name,
+            )
+            return primary or secondary  # type: ignore[return-value]
+        # Neither custom engine available → fall back to PaddleOCR so VLM hints still work
+        _logger.warning(
+            "Cross-validation: neither '%s' nor '%s' is installed. "
+            "Falling back to PaddleOCR for OCR hints. "
+            "Install both with: cd backend && pip install -e '.[auto]'",
+            primary_name, secondary_name,
+        )
+        return _build_single_engine_by_name("paddle")
+
+    # ── auto: try rapidocr → apple_vision → paddle（与 cross_validate 默认一致）────────
+    if name == "auto":
+        for candidate in ("rapidocr", "apple_vision", "paddle"):
+            engine = _build_single_engine_by_name(candidate)
+            if engine:
+                _logger.info("OCR engine (auto-selected): %s", candidate)
+                return engine
+        return False
+
+    # ── explicit single engine ───────────────────────────────────────────────
+    return _build_single_engine_by_name(name)
 
 
 @dataclass
@@ -474,13 +1021,7 @@ class DocumentExtractor:
     def _load_ocr(self):
         if self._ocr is not None:
             return self._ocr
-        try:
-            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-            from paddleocr import PaddleOCR
-
-            self._ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
-        except Exception:
-            self._ocr = False
+        self._ocr = _build_ocr_engine_wrapper()
         return self._ocr
 
     def _load_structure(self):
@@ -488,6 +1029,7 @@ class DocumentExtractor:
             return self._structure
         try:
             os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+            _configure_paddle_device()
             try:
                 from paddleocr import PPStructure
             except ImportError:
@@ -557,16 +1099,13 @@ class DocumentExtractor:
         # --- Dual-Engine Consensus: Get OCR hints first if VLM is enabled ---
         ocr_hints = None
         extracted_ocr_blocks = None
+        _cv_hint_summary = None  # cross_validation from OCR hint step (used when VLM is primary)
         if is_vlm_enabled() and ocr is not None and image is not None:
             try:
-                try:
-                    result = ocr.ocr(image, cls=True)
-                except TypeError:
-                    result = ocr.ocr(image)
-                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                extracted_ocr_blocks, ocr_text = ocr.predict(image, image_pil)
                 if ocr_text.strip():
                     ocr_hints = ocr_text
+                _cv_hint_summary = compute_cross_validation_summary(extracted_ocr_blocks)
             except Exception as e:
                 notes.append(f"Pre-VLM OCR extraction failed: {e}")
 
@@ -583,7 +1122,12 @@ class DocumentExtractor:
 
         if vlm_blocks is not None:
             from app.vlm import get_vlm_config
-            from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+            from app.validation import (
+                compute_consensus_score,
+                compute_vlm_confidence,
+                merge_legal_field_page_diffs,
+                validate_legal_fields,
+            )
 
             cfg = get_vlm_config()
             engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
@@ -617,6 +1161,12 @@ class DocumentExtractor:
             field_warnings = validate_legal_fields(blocks)
             notes.extend(field_warnings)
 
+            page_diff = _legal_diff_for_vlm_page(vlm_blocks, ocr_combined_text, 1)
+            if page_diff.get("has_discrepancy"):
+                notes.append(
+                    "案号/金额：OCR 与 VLM 不一致，请查看下方「关键字段 OCR/VLM 对照」。"
+                )
+
             return {
                 "pages": 1,
                 "text": "\n".join([b["text"] for b in blocks]),
@@ -625,6 +1175,9 @@ class DocumentExtractor:
                 "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
                 "vlm_used": True,
                 "vlm_engine": engine_str,
+                "legal_field_diffs": merge_legal_field_page_diffs([page_diff]),
+                # Cross-validation summary comes from OCR hint blocks (not VLM blocks)
+                "cross_validation_summary": _cv_hint_summary,
             }
         
         # --- Fallback: Geometric Structure & OCR ---
@@ -673,16 +1226,12 @@ class DocumentExtractor:
                         "relations": [],
                         "group_id": "single",
                         "table_html": None,
+                        "cross_validation": el.get("cross_validation"),
                     }
                 )
         else:
             try:
-                try:
-                    result = ocr.ocr(image, cls=True)
-                except TypeError:
-                    result = ocr.ocr(image)
-                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                extracted_blocks, text = _reconstruct_layout(res_data)
+                extracted_blocks, text = ocr.predict(image, image_pil)
                 for idx, el in enumerate(extracted_blocks):
                     blocks.append(
                         {
@@ -698,6 +1247,7 @@ class DocumentExtractor:
                             "relations": [],
                             "group_id": "single",
                             "table_html": None,
+                            "cross_validation": el.get("cross_validation"),
                         }
                     )
             except Exception as exc:
@@ -741,9 +1291,10 @@ class DocumentExtractor:
         vlm_used_any = False
         cfg = get_vlm_config()
         vlm_engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
-        
+        legal_diff_pages: list[dict] = []
+
         import concurrent.futures
-        
+
         # Step 1: Pre-process pages & run sequential PaddleOCR
         # PaddleOCR is run sequentially to avoid thread-safety issues with its C++ runtime
         page_tasks = []
@@ -753,7 +1304,7 @@ class DocumentExtractor:
                 page_tasks.append({"page_index": page_index, "type": "native_text", "text": page_text})
                 continue
             
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=_pdf_pixmap_matrix(fitz), alpha=False)
             image_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
             
             image = None
@@ -769,12 +1320,7 @@ class DocumentExtractor:
             extracted_ocr_blocks = None
             if is_vlm_enabled() and ocr is not None and image is not None:
                 try:
-                    try:
-                        result = ocr.ocr(image, cls=True)
-                    except TypeError:
-                        result = ocr.ocr(image)
-                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                    extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                    extracted_ocr_blocks, ocr_text = ocr.predict(image, image_pil)
                     if ocr_text.strip():
                         ocr_hints = ocr_text
                 except Exception as e:
@@ -859,6 +1405,13 @@ class DocumentExtractor:
 
                 field_warnings = validate_legal_fields([b for b in blocks if b["page"] == page_index])
                 notes.extend(field_warnings)
+
+                ld = _legal_diff_for_vlm_page(vlm_blocks, ocr_combined_text, page_index)
+                legal_diff_pages.append(ld)
+                if ld.get("has_discrepancy"):
+                    notes.append(
+                        f"page {page_index}: 案号/金额在 OCR 与 VLM 间不一致（见「关键字段 OCR/VLM 对照」）"
+                    )
                 continue
 
             if image is None:
@@ -888,17 +1441,13 @@ class DocumentExtractor:
                         "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
                         "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
                         "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                        "cross_validation": el.get("cross_validation"),
                     })
                 if ocr_hints:
                     full_text.append(ocr_hints)
             else:
                 try:
-                    try:
-                        result = ocr.ocr(image, cls=True)
-                    except TypeError:
-                        result = ocr.ocr(image)
-                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                    extracted_blocks, normalized = _reconstruct_layout(res_data)
+                    extracted_blocks, normalized = ocr.predict(image, image_pil)
                     full_text.append(normalized)
                     for idx, el in enumerate(extracted_blocks):
                         blocks.append({
@@ -906,6 +1455,7 @@ class DocumentExtractor:
                             "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
                             "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
                             "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                            "cross_validation": el.get("cross_validation"),
                         })
                 except Exception as exc:
                     notes.append(f"page {page_index}: OCR failed ({exc})")
@@ -913,7 +1463,7 @@ class DocumentExtractor:
         page_infos = []
         for page_index, page in enumerate(doc, start=1):
             rect = page.rect
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=_pdf_pixmap_matrix(fitz), alpha=False)
             image_data = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode('utf-8')}"
             page_infos.append({
                 "page": page_index,
@@ -924,6 +1474,15 @@ class DocumentExtractor:
                 "layout_type": None,
             })
 
+        from app.validation import merge_legal_field_page_diffs
+
+        # Aggregate OCR hint blocks from all VLM-processed pages for cross-validation summary
+        _pdf_ocr_hint_blocks: list[dict] = []
+        for task in page_tasks:
+            if task.get("type") == "image" and task.get("vlm_blocks") is not None:
+                _pdf_ocr_hint_blocks.extend(task.get("extracted_ocr_blocks") or [])
+        _pdf_cv_summary = compute_cross_validation_summary(_pdf_ocr_hint_blocks) if _pdf_ocr_hint_blocks else None
+
         return {
             "pages": len(doc),
             "text": "\n\n".join(part for part in full_text if part),
@@ -932,6 +1491,11 @@ class DocumentExtractor:
             "page_infos": page_infos,
             "vlm_used": vlm_used_any,
             "vlm_engine": vlm_engine_str if vlm_used_any else None,
+            "legal_field_diffs": merge_legal_field_page_diffs(legal_diff_pages)
+            if (vlm_used_any and legal_diff_pages)
+            else None,
+            # Cross-validation from OCR hint blocks (only relevant when VLM ran over them)
+            "cross_validation_summary": _pdf_cv_summary,
         }
 
     def extract_stream(
@@ -1003,19 +1567,17 @@ class DocumentExtractor:
             except ImportError:
                 notes.append("Numpy is not installed; OCR/Structure fallback unavailable.")
 
-        # VLM attempt
+        # VLM attempt (same pre-OCR as sync path: hints + blocks for dual-engine consensus)
         if is_vlm_enabled() and image_data:
             ocr_hints = None
+            extracted_ocr_blocks = None
+            _cv_hint_summary_stream = None
             if ocr is not None and image is not None:
                 try:
-                    try:
-                        result = ocr.ocr(image, cls=True)
-                    except TypeError:
-                        result = ocr.ocr(image)
-                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                    _, ocr_text = _reconstruct_layout(res_data)
+                    extracted_ocr_blocks, ocr_text = ocr.predict(image, image_pil)
                     if ocr_text.strip():
                         ocr_hints = ocr_text
+                    _cv_hint_summary_stream = compute_cross_validation_summary(extracted_ocr_blocks)
                 except Exception:
                     pass
 
@@ -1033,10 +1595,20 @@ class DocumentExtractor:
 
             if vlm_blocks is not None:
                 from app.vlm import get_vlm_config
-                from app.validation import compute_consensus_score, compute_vlm_confidence, validate_legal_fields
+                from app.validation import (
+                    compute_consensus_score,
+                    compute_vlm_confidence,
+                    merge_legal_field_page_diffs,
+                    validate_legal_fields,
+                )
 
                 cfg = get_vlm_config()
                 engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+
+                ocr_combined_text = ocr_hints or ""
+                if extracted_ocr_blocks:
+                    consensus = compute_consensus_score(vlm_blocks, extracted_ocr_blocks, ocr_combined_text)
+                    notes.extend(consensus["warnings"])
 
                 blocks = []
                 for idx, el in enumerate(vlm_blocks):
@@ -1047,7 +1619,9 @@ class DocumentExtractor:
                     blocks.append({
                         "page": 1, "type": el.get("type", "text"), "structure_type": "text",
                         "text": txt, "bbox": bbox,
-                        "confidence": compute_vlm_confidence(el, [], ""),
+                        "confidence": compute_vlm_confidence(
+                            el, extracted_ocr_blocks or [], ocr_combined_text
+                        ),
                         "reading_order": idx, "hierarchy_level": el.get("hierarchy_level", 4),
                         "parent_id": None, "relations": [], "group_id": el.get("group_id", "single"),
                         "table_html": None,
@@ -1056,11 +1630,19 @@ class DocumentExtractor:
                 field_warnings = validate_legal_fields(blocks)
                 notes.extend(field_warnings)
 
+                page_diff = _legal_diff_for_vlm_page(vlm_blocks, ocr_combined_text, 1)
+                if page_diff.get("has_discrepancy"):
+                    notes.append(
+                        "案号/金额：OCR 与 VLM 不一致，请查看下方「关键字段 OCR/VLM 对照」。"
+                    )
+
                 result = {
                     "pages": 1, "text": "\n".join([b["text"] for b in blocks]),
                     "blocks": blocks, "notes": notes,
                     "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
                     "vlm_used": True, "vlm_engine": engine_str,
+                    "legal_field_diffs": merge_legal_field_page_diffs([page_diff]),
+                    "cross_validation_summary": _cv_hint_summary_stream,
                 }
 
                 yield sse_format(ProgressEvent(
@@ -1110,12 +1692,7 @@ class DocumentExtractor:
                 progress=0.6, engine="ocr",
             ))
             try:
-                try:
-                    result = ocr.ocr(image, cls=True)
-                except TypeError:
-                    result = ocr.ocr(image)
-                res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                extracted_blocks, text = _reconstruct_layout(res_data)
+                extracted_blocks, text = ocr.predict(image, image_pil)
                 blocks = []
                 for idx, el in enumerate(extracted_blocks):
                     blocks.append({
@@ -1123,11 +1700,13 @@ class DocumentExtractor:
                         "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
                         "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
                         "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                        "cross_validation": el.get("cross_validation"),
                     })
                 result = {
                     "pages": 1, "text": text, "blocks": blocks, "notes": notes,
                     "page_infos": [{"page": 1, "width": float(w), "height": float(h), "image_data": image_data, "columns": None, "layout_type": None}],
                     "vlm_used": False, "vlm_engine": None,
+                    "cross_validation_summary": compute_cross_validation_summary(blocks),
                 }
                 yield sse_format(ProgressEvent(
                     stage="complete", message="OCR extraction complete", progress=1.0,
@@ -1195,6 +1774,7 @@ class DocumentExtractor:
         vlm_used_any = False
         cfg = get_vlm_config()
         vlm_engine_str = f"{cfg.get('provider', 'unknown')} · {cfg.get('model', 'unknown')}"
+        legal_diff_pages: list[dict] = []
 
         # Step 1: Pre-process pages sequentially
         page_tasks = []
@@ -1209,7 +1789,7 @@ class DocumentExtractor:
                 page_tasks.append({"page_index": page_index, "type": "native_text", "text": page_text})
                 continue
 
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=_pdf_pixmap_matrix(fitz), alpha=False)
             image_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
             image = None
@@ -1224,12 +1804,7 @@ class DocumentExtractor:
             extracted_ocr_blocks = None
             if is_vlm_enabled() and ocr is not None and image is not None:
                 try:
-                    try:
-                        result = ocr.ocr(image, cls=True)
-                    except TypeError:
-                        result = ocr.ocr(image)
-                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                    extracted_ocr_blocks, ocr_text = _reconstruct_layout(res_data)
+                    extracted_ocr_blocks, ocr_text = ocr.predict(image, image_pil)
                     if ocr_text.strip():
                         ocr_hints = ocr_text
                 except Exception as e:
@@ -1331,6 +1906,13 @@ class DocumentExtractor:
 
                 field_warnings = validate_legal_fields([b for b in blocks if b["page"] == page_index])
                 notes.extend(field_warnings)
+
+                ld = _legal_diff_for_vlm_page(vlm_blocks, ocr_combined_text, page_index)
+                legal_diff_pages.append(ld)
+                if ld.get("has_discrepancy"):
+                    notes.append(
+                        f"page {page_index}: 案号/金额在 OCR 与 VLM 间不一致（见「关键字段 OCR/VLM 对照」）"
+                    )
                 continue
 
             if image is None:
@@ -1360,17 +1942,13 @@ class DocumentExtractor:
                         "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
                         "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
                         "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                        "cross_validation": el.get("cross_validation"),
                     })
                 if ocr_hints:
                     full_text.append(ocr_hints)
             else:
                 try:
-                    try:
-                        result = ocr.ocr(image, cls=True)
-                    except TypeError:
-                        result = ocr.ocr(image)
-                    res_data = result[0] if result and isinstance(result, (list, tuple)) and len(result) > 0 else result
-                    extracted_blocks, normalized = _reconstruct_layout(res_data)
+                    extracted_blocks, normalized = ocr.predict(image, image_pil)
                     full_text.append(normalized)
                     for idx, el in enumerate(extracted_blocks):
                         blocks.append({
@@ -1378,6 +1956,7 @@ class DocumentExtractor:
                             "text": el["text"], "bbox": [float(v) for point in el["bbox"] for v in point],
                             "confidence": el["score"], "reading_order": idx, "hierarchy_level": 4,
                             "parent_id": None, "relations": [], "group_id": "single", "table_html": None,
+                            "cross_validation": el.get("cross_validation"),
                         })
                 except Exception as exc:
                     notes.append(f"page {page_index}: OCR failed ({exc})")
@@ -1385,12 +1964,26 @@ class DocumentExtractor:
         page_infos = []
         for page_index, page in enumerate(doc, start=1):
             rect = page.rect
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=_pdf_pixmap_matrix(fitz), alpha=False)
             image_data = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode('utf-8')}"
             page_infos.append({
                 "page": page_index, "width": rect.width, "height": rect.height,
                 "image_data": image_data, "columns": None, "layout_type": None,
             })
+
+        from app.validation import merge_legal_field_page_diffs
+
+        # When VLM ran, final blocks are VLM blocks (no cross_validation field).
+        # Use OCR hint blocks for the summary instead.
+        _stream_ocr_hint_blocks: list[dict] = []
+        for _t in page_tasks:
+            if _t.get("type") == "image" and _t.get("vlm_blocks") is not None:
+                _stream_ocr_hint_blocks.extend(_t.get("extracted_ocr_blocks") or [])
+        _stream_cv_summary = (
+            compute_cross_validation_summary(_stream_ocr_hint_blocks)
+            if _stream_ocr_hint_blocks
+            else compute_cross_validation_summary(blocks)
+        )
 
         result = {
             "pages": len(doc),
@@ -1398,6 +1991,10 @@ class DocumentExtractor:
             "blocks": blocks, "notes": notes, "page_infos": page_infos,
             "vlm_used": vlm_used_any,
             "vlm_engine": vlm_engine_str if vlm_used_any else None,
+            "legal_field_diffs": merge_legal_field_page_diffs(legal_diff_pages)
+            if (vlm_used_any and legal_diff_pages)
+            else None,
+            "cross_validation_summary": _stream_cv_summary,
         }
 
         yield sse_format(ProgressEvent(

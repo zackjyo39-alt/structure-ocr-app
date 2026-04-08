@@ -1,16 +1,23 @@
 """
 Validation layer for legal document OCR extraction.
 
-Provides:
-  - Dual-Engine Consensus: compare VLM vs PaddleOCR outputs
-  - Legal field regex validation: case numbers, dates, amounts
-  - Per-block confidence scoring (replaces hardcoded 1.0)
+Cross-checks (accuracy-oriented; VLM 开启时尽量与几何 OCR 对齐):
+  - Dual-engine consensus: VLM 全文 vs PaddleOCR 全文（字符 bigram Jaccard）+
+    块数量比例，异常时写入 notes 提醒人工复核
+  - Per-block confidence: OCR 子串/字级 bigram 重合、法律 group_id、bbox 是否可用
+  - Legal field heuristics: 案号、日期、金额等正则扫描，可疑值写入 warnings
+  - 关键字段结构化对照: 案号/金额从 VLM 合并文本与 OCR hint 分别抽取，
+    多重集对齐后写入 API `legal_field_diffs`（供前端并排展示与块级标红）
+
+说明：最终展示文本仍以 VLM 结构化结果为主；共识层与对照层均不自动改写正文，避免静默篡改案号/金额。
 """
 
 from __future__ import annotations
 
-import re
 import logging
+import os
+import re
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +146,140 @@ def validate_legal_fields(blocks: list[dict]) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
+# ---------------------------------------------------------------------------
+# OCR vs VLM: 案号 / 金额 结构化对照（不修改正文，仅输出 diff）
+# ---------------------------------------------------------------------------
+
+
+def _normalize_case_number(raw: str) -> str:
+    return (
+        raw.replace("（", "(")
+        .replace("）", ")")
+        .replace(" ", "")
+        .replace("\u3000", "")
+    )
+
+
+def _extract_case_number_spans(text: str) -> list[str]:
+    return [m.group(0) for m in _CASE_NUMBER_RE.finditer(text or "")]
+
+
+def _extract_amount_spans(text: str) -> list[tuple[str, float]]:
+    """(原始片段, 数值元) 按出现顺序；避免 ¥ 与「元」重复匹配重叠。"""
+    if not text:
+        return []
+    spans: list[tuple[int, int, str, float]] = []
+    for m in _AMOUNT_YUAN_RE.finditer(text):
+        spans.append((m.start(), m.end(), m.group(0), float(m.group(1).replace(",", ""))))
+    for m in _AMOUNT_YUAN_DECIMAL_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if any(max(a, s) < min(b, e) for a, b, _, _ in spans):
+            continue
+        spans.append((s, e, m.group(0), float(m.group(1).replace(",", ""))))
+    spans.sort(key=lambda x: x[0])
+    return [(raw, val) for _, _, raw, val in spans]
+
+
+def _amount_match_key(val: float) -> str:
+    return f"{round(val, 2):.2f}"
+
+
+def _pair_case_number_rows(v_list: list[str], o_list: list[str]) -> list[dict]:
+    vb: defaultdict[str, list[str]] = defaultdict(list)
+    for r in v_list:
+        vb[_normalize_case_number(r)].append(r)
+    ob: defaultdict[str, list[str]] = defaultdict(list)
+    for r in o_list:
+        ob[_normalize_case_number(r)].append(r)
+    rows: list[dict] = []
+    for k in sorted(set(vb) | set(ob), key=lambda x: (x == "", x)):
+        vs = vb.get(k, [])
+        os_ = ob.get(k, [])
+        n = min(len(vs), len(os_))
+        for i in range(n):
+            rows.append({"status": "match", "vlm_raw": vs[i], "ocr_raw": os_[i], "normalized": k})
+        for j in range(n, len(vs)):
+            rows.append({"status": "vlm_only", "vlm_raw": vs[j], "ocr_raw": None, "normalized": k})
+        for j in range(n, len(os_)):
+            rows.append({"status": "ocr_only", "vlm_raw": None, "ocr_raw": os_[j], "normalized": k})
+    return rows
+
+
+def _pair_amount_rows(
+    v_pairs: list[tuple[str, float]],
+    o_pairs: list[tuple[str, float]],
+) -> list[dict]:
+    vb: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+    for r, v in v_pairs:
+        vb[_amount_match_key(v)].append((r, v))
+    ob: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+    for r, v in o_pairs:
+        ob[_amount_match_key(v)].append((r, v))
+    rows: list[dict] = []
+    for k in sorted(set(vb) | set(ob), key=lambda x: (x == "", x)):
+        vs = vb.get(k, [])
+        os_ = ob.get(k, [])
+        n = min(len(vs), len(os_))
+        for i in range(n):
+            vr, vv = vs[i]
+            oraw, _ov = os_[i]
+            rows.append({"status": "match", "vlm_raw": vr, "ocr_raw": oraw, "value_yuan": vv})
+        for j in range(n, len(vs)):
+            vr, vv = vs[j]
+            rows.append({"status": "vlm_only", "vlm_raw": vr, "ocr_raw": None, "value_yuan": vv})
+        for j in range(n, len(os_)):
+            oraw, ov = os_[j]
+            rows.append({"status": "ocr_only", "vlm_raw": None, "ocr_raw": oraw, "value_yuan": ov})
+    return rows
+
+
+def compute_legal_field_diffs_for_page(
+    vlm_text: str,
+    ocr_text: str | None,
+    page: int,
+) -> dict:
+    """单页：从 VLM 全文与 OCR 全文抽取案号、金额并做多重集对齐。"""
+    ocr_t = (ocr_text or "").strip()
+    vlm_t = vlm_text or ""
+    if not ocr_t:
+        return {
+            "page": page,
+            "case_numbers": [],
+            "amounts": [],
+            "has_discrepancy": False,
+            "ocr_unavailable": True,
+        }
+
+    case_rows = _pair_case_number_rows(
+        _extract_case_number_spans(vlm_t),
+        _extract_case_number_spans(ocr_t),
+    )
+    amt_rows = _pair_amount_rows(
+        _extract_amount_spans(vlm_t),
+        _extract_amount_spans(ocr_t),
+    )
+
+    def _has_mismatch(rows: list[dict]) -> bool:
+        return any(r["status"] != "match" for r in rows)
+
+    return {
+        "page": page,
+        "case_numbers": case_rows,
+        "amounts": amt_rows,
+        "has_discrepancy": _has_mismatch(case_rows) or _has_mismatch(amt_rows),
+        "ocr_unavailable": False,
+    }
+
+
+def merge_legal_field_page_diffs(pages: list[dict]) -> dict | None:
+    if not pages:
+        return None
+    return {
+        "has_discrepancy": any(p.get("has_discrepancy") for p in pages),
+        "pages": pages,
+    }
+
+
 def compute_consensus_score(
     vlm_blocks: list[dict],
     ocr_blocks: list[dict],
@@ -169,7 +310,9 @@ def compute_consensus_score(
     else:
         block_ratio = float(len(vlm_blocks)) if vlm_blocks else 1.0
 
-    if text_similarity < 0.5 and combined_ocr.strip():
+    # 略严阈值：法律场景宁可多报警、少漏报（可调低环境变量以放宽）
+    _sim_warn = float(os.environ.get("VLM_CONSENSUS_SIM_WARN_BELOW", "0.58"))
+    if text_similarity < _sim_warn and combined_ocr.strip():
         warnings.append(
             f"VLM 提取文本与 PaddleOCR 结果差异较大 (相似度 {text_similarity:.0%})，建议人工复核"
         )
@@ -214,10 +357,9 @@ def compute_vlm_confidence(
     if ocr_text and text.strip() in ocr_text:
         confidence += 0.10
     elif ocr_text:
-        # Partial match: check if > 60% of words appear
-        vlm_words = set(text.strip())
-        ocr_words = set(ocr_text)
-        if vlm_words and len(vlm_words & ocr_words) / len(vlm_words) > 0.6:
+        # 中英混合法律文本：用字级 bigram 与 OCR 全文的局部重合（非「按字符当单词」）
+        t = text.strip()
+        if len(t) >= 2 and _jaccard_bigram_similarity(t, ocr_text) >= 0.35:
             confidence += 0.05
 
     # Legal field bonus

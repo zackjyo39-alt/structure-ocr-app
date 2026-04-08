@@ -51,6 +51,229 @@ function lineColAtOffset(text, offset) {
   return { line, col };
 }
 
+/** Layout 块是否与「案号/金额 OCR↔VLM 不一致」片段相交（用于标红提示） */
+function blockTouchesLegalDiff(block, diffs) {
+  if (!diffs?.pages?.length || !block?.text) return false;
+  const t = block.text;
+  for (const p of diffs.pages) {
+    for (const row of [...(p.case_numbers || []), ...(p.amounts || [])]) {
+      if (row.status === "match") continue;
+      if (row.vlm_raw && t.includes(row.vlm_raw)) return true;
+      if (row.ocr_raw && t.includes(row.ocr_raw)) return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-validation helpers
+// ---------------------------------------------------------------------------
+
+function cvStatusMeta(status) {
+  return {
+    match:          { label: "双引擎一致",   color: "#34d399", bg: "rgba(52,211,153,0.12)" },
+    mismatch:       { label: "不一致·需复核", color: "#f87171", bg: "rgba(248,113,113,0.14)" },
+    primary_only:   { label: "仅主引擎",     color: "#fbbf24", bg: "rgba(251,191,36,0.12)" },
+    secondary_only: { label: "仅副引擎",     color: "#a78bfa", bg: "rgba(167,139,250,0.12)" },
+  }[status] || { label: status, color: "#9ca3af", bg: "transparent" };
+}
+
+function CrossValidationSummaryPanel({ summary }) {
+  if (!summary) return null;
+
+  const { primary_engine, secondary_engine, total_blocks, matched, mismatched,
+          primary_only, secondary_only, agreement_rate, mismatches } = summary;
+  const isGreen = agreement_rate >= 0.95;
+  const isYellow = !isGreen && agreement_rate >= 0.80;
+
+  const borderColor = isGreen ? "rgba(52,211,153,0.5)"
+                    : isYellow ? "rgba(251,191,36,0.5)"
+                    : "rgba(248,113,113,0.5)";
+  const bgColor = isGreen ? "rgba(52,211,153,0.06)"
+                : isYellow ? "rgba(251,191,36,0.06)"
+                : "rgba(248,113,113,0.06)";
+  const rateColor = isGreen ? "#34d399" : isYellow ? "#fbbf24" : "#f87171";
+
+  return (
+    <div style={{ marginBottom: 12, borderRadius: 8, border: `1px solid ${borderColor}`, background: bgColor, padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3" }}>
+          🔄 双引擎交叉验证报告
+        </span>
+        <span style={{ fontSize: 12, color: "#6b7280" }}>
+          {primary_engine} × {secondary_engine}
+        </span>
+        <span style={{ marginLeft: "auto", fontSize: 13, fontWeight: 700, color: rateColor }}>
+          一致率 {(agreement_rate * 100).toFixed(1)}%
+        </span>
+      </div>
+
+      {/* Stats grid */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        {[
+          { label: "总块数", value: total_blocks, color: "#9ca3af" },
+          { label: "一致",   value: matched,      color: "#34d399" },
+          { label: "不一致", value: mismatched,    color: "#f87171" },
+          { label: "仅主引擎", value: primary_only, color: "#fbbf24" },
+          { label: "仅副引擎", value: secondary_only, color: "#a78bfa" },
+        ].map(({ label, value, color }) => (
+          <div key={label} style={{
+            background: "#1c2128", borderRadius: 6, padding: "4px 10px",
+            fontSize: 12, color: "#9ca3af", border: "1px solid #30363d",
+          }}>
+            <span style={{ color }}>{value}</span> {label}
+          </div>
+        ))}
+      </div>
+
+      {/* Mismatch detail table */}
+      {mismatches?.length > 0 && (
+        <div>
+          <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 6, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+            不一致明细（需人工复核）
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "36px minmax(0,1fr) minmax(0,1fr) 52px", gap: 4, fontSize: 11, color: "#6b7280", marginBottom: 4 }}>
+            <span>页</span><span>主引擎文本</span><span>副引擎文本</span><span>相似度</span>
+          </div>
+          {mismatches.slice(0, 8).map((m, i) => (
+            <div key={i} style={{
+              display: "grid", gridTemplateColumns: "36px minmax(0,1fr) minmax(0,1fr) 52px",
+              gap: 4, padding: "5px 0", borderTop: "1px solid #21262d",
+              alignItems: "start", fontSize: 12,
+            }}>
+              <span style={{ color: "#6b7280" }}>{m.page}</span>
+              <span style={{ color: "#f87171", wordBreak: "break-all" }}>{m.primary_text || "—"}</span>
+              <span style={{ color: "#fbbf24", wordBreak: "break-all" }}>{m.secondary_text || "—"}</span>
+              <span style={{ color: "#9ca3af" }}>{((m.similarity ?? 0) * 100).toFixed(0)}%</span>
+            </div>
+          ))}
+          {mismatches.length > 8 && (
+            <div style={{ fontSize: 11, color: "#6b7280", paddingTop: 4 }}>
+              …还有 {mismatches.length - 8} 处不一致
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{ fontSize: 11, color: "#4b5563", marginTop: 8, lineHeight: 1.5 }}>
+        算法：逐块 IoU 区域对齐 + 字符 bigram Jaccard 文本相似度；阈值 IoU≥0.35 / 文本≥0.80 判为一致。
+      </div>
+    </div>
+  );
+}
+
+function statusLabelLegalDiff(status) {
+  const m = { match: "一致", vlm_only: "仅 VLM", ocr_only: "仅 OCR" };
+  return m[status] || status;
+}
+
+function LegalFieldDiffPanel({ diffs }) {
+  if (!diffs?.pages?.length) return null;
+
+  const rows = [];
+  for (const p of diffs.pages) {
+    const pn = p.page;
+    if (p.ocr_unavailable) {
+      rows.push({
+        key: `p${pn}-skip`,
+        page: pn,
+        kind: "meta",
+        text: "本页无 OCR 全文对照（未生成 OCR hint，请确认 OCR 引擎已安装：pip install -e '.[auto]'）",
+      });
+      continue;
+    }
+    const cn = p.case_numbers || [];
+    const am = p.amounts || [];
+    if (!cn.length && !am.length) continue;
+    for (const r of cn) {
+      rows.push({ key: `p${pn}-c-${rows.length}`, page: pn, kind: "案号", ...r });
+    }
+    for (const r of am) {
+      rows.push({ key: `p${pn}-a-${rows.length}`, page: pn, kind: "金额", ...r });
+    }
+  }
+
+  if (!rows.length) return null;
+
+  const anyBad = !!diffs.has_discrepancy;
+
+  const cell = (val, hot) => (
+    <span style={{
+      color: hot ? "#f87171" : "#e6edf3",
+      background: hot ? "rgba(248,113,113,0.14)" : "transparent",
+      padding: "2px 4px",
+      borderRadius: 4,
+      wordBreak: "break-all",
+    }}>{val || "—"}</span>
+  );
+
+  return (
+    <div style={{
+      marginBottom: 12,
+      borderRadius: 8,
+      border: anyBad ? "1px solid rgba(248,113,113,0.45)" : "1px solid rgba(52,211,153,0.35)",
+      background: anyBad ? "rgba(248,113,113,0.06)" : "rgba(52,211,153,0.06)",
+      padding: "12px 14px",
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3", marginBottom: 8 }}>
+        关键字段 OCR / VLM 对照
+        {anyBad ? (
+          <span style={{ marginLeft: 8, color: "#f87171", fontWeight: 500 }}>存在不一致，请人工复核</span>
+        ) : (
+          <span style={{ marginLeft: 8, color: "#34d399", fontWeight: 500 }}>已抽取项成对一致</span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 10, lineHeight: 1.5 }}>
+        正则从 VLM 合并文本与 OCR hint 抽取；案号在比对前归一全半角括号；金额按数值（分到分）对齐。
+      </div>
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "44px 44px minmax(0,1fr) minmax(0,1fr) 64px",
+        gap: 6,
+        fontSize: 12,
+        color: "#9ca3af",
+        marginBottom: 4,
+      }}>
+        <span>页</span>
+        <span>类</span>
+        <span>VLM</span>
+        <span>OCR</span>
+        <span>状态</span>
+      </div>
+      {rows.map((row) => {
+        if (row.kind === "meta") {
+          return (
+            <div key={row.key} style={{ fontSize: 12, color: "#8b949e", marginBottom: 8 }}>
+              第 {row.page} 页 · {row.text}
+            </div>
+          );
+        }
+        const st = row.status;
+        const isOk = st === "match";
+        return (
+          <div
+            key={row.key}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "44px 44px minmax(0,1fr) minmax(0,1fr) 64px",
+              gap: 6,
+              alignItems: "start",
+              padding: "6px 0",
+              borderTop: "1px solid #30363d",
+              fontSize: 12,
+            }}
+          >
+            <span style={{ color: "#8b949e" }}>{row.page}</span>
+            <span style={{ color: "#a78bfa" }}>{row.kind}</span>
+            <div>{cell(row.vlm_raw, st === "vlm_only")}</div>
+            <div>{cell(row.ocr_raw, st === "ocr_only")}</div>
+            <span style={{ color: isOk ? "#34d399" : "#fbbf24" }}>{statusLabelLegalDiff(st)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function offsetFromPointInTextElement(el, clientX, clientY) {
   if (!el) return null;
   let range = null;
@@ -438,6 +661,7 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
   const [error, setError] = useState("");
   const [ollamaStatus, setOllamaStatus] = useState(null); // null | "checking" | "running" | "stopped"
   const [ollamaModels, setOllamaModels] = useState([]);
+  const [testStatus, setTestStatus] = useState(null); // null | "testing" | { status: "ok"|"error"|"warning", message?: string, error?: string }
 
   const checkOllama = useCallback(async (baseUrl) => {
     setOllamaStatus("checking");
@@ -465,13 +689,17 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
   const presets = useMemo(() => vlmConfig?.presets || {}, [vlmConfig]);
   const presetEntries = useMemo(() => Object.entries(presets), [presets]);
 
+  const defaultGeminiBase = "https://generativelanguage.googleapis.com/v1beta";
+
   useEffect(() => {
     if (!vlmConfig) return;
+    const prov = (vlmConfig.provider || "ollama").toLowerCase();
+    const bu = (vlmConfig.base_url || "").trim();
     setForm({
       enabled: !!vlmConfig.enabled,
       provider: vlmConfig.provider || "ollama",
       model: vlmConfig.model || "",
-      base_url: vlmConfig.base_url || "",
+      base_url: prov === "gemini" && !bu ? defaultGeminiBase : vlmConfig.base_url || "",
       api_key: vlmConfig.api_key || "",
     });
   }, [vlmConfig]);
@@ -505,16 +733,6 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
 
   const handlePresetChange = (presetId) => {
     if (!presetId) return;
-    if (presetId === "__local_deepseek__") {
-      setForm((current) => ({
-        ...current,
-        provider: "ollama",
-        model: "deepseek-ocr:3b",
-        base_url: "http://localhost:11434/api/chat",
-      }));
-      setStatus("已载入预设：Ollama · deepseek-ocr:3b");
-      return;
-    }
     const preset = presets[presetId];
     if (!preset) return;
     setForm((current) => ({
@@ -557,6 +775,32 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
     }
   };
 
+  const handleTest = async () => {
+    setTestStatus("testing");
+    setStatus("");
+    setError("");
+    try {
+      const payload = {
+        provider: form.provider.trim(),
+        model: form.model.trim(),
+        base_url: form.base_url.trim(),
+        api_key: form.api_key,
+      };
+      const res = await fetch(`${API_BASE}/api/vlm-test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      }
+      const data = await res.json();
+      setTestStatus(data);
+    } catch (err) {
+      setTestStatus({ status: "error", error: err.message || String(err) });
+    }
+  };
+
   const cardStyle = {
     background: "#161b22",
     border: "1px solid #30363d",
@@ -579,7 +823,7 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
             <div>
               <div style={{ fontSize: 16, color: "#e6edf3", fontWeight: 600, marginBottom: 6 }}>VLM 模式</div>
               <div style={{ fontSize: 13, color: "#8b949e", maxWidth: 560 }}>
-                关闭时走旧的几何 PaddleOCR 路线；开启后，后端会优先使用你当前保存的多模态模型配置。
+                关闭时走几何 OCR 路线（引擎由后端环境变量决定）；开启后，后端会优先使用你当前保存的多模态模型配置。
               </div>
             </div>
             <label style={{ display: "flex", alignItems: "center", gap: 10, color: "#e6edf3", fontSize: 14 }}>
@@ -618,36 +862,12 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
               if (id === "nim-paddleocr-vl") label += " · 推荐：轻量化实时应用";
               if (id === "nim-deepseek-ocr") label += " · 推荐：高质量知识库 RAG 压缩";
               if (id === "ollama-deepseek-ocr") label += " · 推荐：完全本地隐私方案";
+              if (id === "ollama-glm-ocr") label += " · VLM 文档 OCR（模型名以 Ollama 为准）";
               return (
                 <option key={id} value={id}>{label}</option>
               );
             })}
-            {!presets["ollama-deepseek-ocr"] && (
-              <option value="__local_deepseek__">Ollama · deepseek-ocr:3b · 推荐：完全本地隐私方案</option>
-            )}
           </select>
-          {!presets["ollama-deepseek-ocr"] && (
-            <button
-              onClick={() => setForm((current) => ({
-                ...current,
-                provider: "ollama",
-                model: "deepseek-ocr:3b",
-                base_url: "http://localhost:11434/api/chat",
-              }))}
-              style={{
-                marginTop: 12,
-                background: "transparent",
-                color: "#7dd3fc",
-                border: "1px solid #164e63",
-                borderRadius: 8,
-                padding: "8px 12px",
-                cursor: "pointer",
-                fontSize: 13,
-              }}
-            >
-              一键填入 Ollama · deepseek-ocr:3b
-            </button>
-          )}
         </div>
 
         <div style={cardStyle}>
@@ -673,7 +893,7 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
               <span style={{ fontSize: 12, color: "#8b949e" }}>
                 Base URL
                 {form.provider === "gemini" && (
-                  <span style={{ marginLeft: 8, color: "#34d399", fontSize: 11 }}>● Auto-managed</span>
+                  <span style={{ marginLeft: 8, color: "#a78bfa", fontSize: 11 }}>● API 根路径，可改 v1 / v1beta</span>
                 )}
               </span>
               <input
@@ -681,23 +901,24 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
                 onChange={(e) => updateField("base_url", e.target.value)}
                 placeholder={
                   form.provider === "gemini"
-                    ? "Auto: https://generativelanguage.googleapis.com/v1beta"
+                    ? "https://generativelanguage.googleapis.com/v1beta（或 …/v1）"
                     : "http://localhost:11434/api/chat"
                 }
-                readOnly={form.provider === "gemini"}
                 style={{
-                  background: form.provider === "gemini" ? "#161b22" : "#0d1117",
-                  color: form.provider === "gemini" ? "#34d399" : "#e6edf3",
-                  border: form.provider === "gemini" ? "1px solid rgba(52,211,153,0.3)" : "1px solid #30363d",
+                  background: "#0d1117",
+                  color: "#e6edf3",
+                  border: "1px solid #30363d",
                   borderRadius: 8,
                   padding: "12px 14px",
                   fontSize: 14,
-                  cursor: form.provider === "gemini" ? "default" : "text",
                 }}
               />
               {form.provider === "gemini" && (
-                <span style={{ fontSize: 11, color: "#6b7280" }}>
-                  Gemini 会自动构造完整 URL，无需手动修改
+                <span style={{ fontSize: 11, color: "#6b7280", lineHeight: 1.4 }}>
+                  仅填写到 <code style={{ color: "#8b949e" }}>/v1beta</code> 或 <code style={{ color: "#8b949e" }}>/v1</code>；后端会拼接{" "}
+                  <code style={{ color: "#8b949e" }}>/models/&lt;model&gt;:generateContent</code>。
+                  若误贴了完整路径，保存时会自动截断到 API 根。模型名须与 Google 文档一致（例如 Gemini 3 Flash 为{" "}
+                  <code style={{ color: "#8b949e" }}>gemini-3-flash-preview</code>）。
                 </span>
               )}
             </label>
@@ -730,7 +951,7 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
                   onChange={(e) => updateField("model", e.target.value)}
                   placeholder={
                     form.provider === "ollama" ? "llava / llama3.2-vision (需先 ollama pull)"
-                    : form.provider === "gemini" ? "gemini-2.5-flash"
+                    : form.provider === "gemini" ? "gemini-2.5-flash 或 gemini-3-flash-preview"
                     : form.provider === "openai" ? "gpt-4o-mini"
                     : "meta/llama-3.2-11b-vision-instruct"
                   }
@@ -763,6 +984,22 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
         </div>
 
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={handleTest}
+            disabled={testStatus === "testing" || saving || loading}
+            style={{
+              padding: "12px 18px",
+              background: testStatus?.status === "ok" ? "rgba(52,211,153,0.15)" : testStatus?.status === "error" ? "rgba(248,113,113,0.15)" : "#10b981",
+              color: testStatus?.status === "ok" ? "#34d399" : testStatus?.status === "error" ? "#f87171" : "#fff",
+              border: testStatus?.status ? `1px solid ${testStatus.status === "ok" ? "rgba(52,211,153,0.4)" : "rgba(248,113,113,0.4)"}` : "none",
+              borderRadius: 8,
+              cursor: testStatus === "testing" || saving || loading ? "not-allowed" : "pointer",
+              fontSize: 14,
+              fontWeight: 600,
+            }}
+          >
+            {testStatus === "testing" ? "测试中..." : testStatus?.status === "ok" ? "✓ 可用" : testStatus?.status === "error" ? "✗ 不可用" : "测试连接"}
+          </button>
           <button
             onClick={handleSave}
             disabled={saving || loading}
@@ -797,6 +1034,20 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
           {status && <span style={{ fontSize: 13, color: "#34d399" }}>{status}</span>}
           {error && <span style={{ fontSize: 13, color: "#f87171" }}>{error}</span>}
         </div>
+
+        {testStatus && testStatus !== "testing" && (
+          <div style={{
+            background: testStatus.status === "ok" ? "rgba(52,211,153,0.08)" : testStatus.status === "warning" ? "rgba(251,191,36,0.08)" : "rgba(248,113,113,0.08)",
+            border: `1px solid ${testStatus.status === "ok" ? "rgba(52,211,153,0.25)" : testStatus.status === "warning" ? "rgba(251,191,36,0.25)" : "rgba(248,113,113,0.25)"}`,
+            borderRadius: 8,
+            padding: "12px 16px",
+            fontSize: 13,
+            lineHeight: 1.6,
+            color: testStatus.status === "ok" ? "#34d399" : testStatus.status === "warning" ? "#fbbf24" : "#f87171",
+          }}>
+            {testStatus.message || testStatus.error || "未知状态"}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1146,7 +1397,7 @@ function ProgressPanel({ progress, events }) {
 
   const engineLabel = {
     vlm: "VLM",
-    ocr: "PaddleOCR",
+    ocr: "几何OCR",
     structure: "PPStructure",
     native_text: "Native PDF text",
   };
@@ -1303,9 +1554,15 @@ function ResultPanel({
         )}
         {loading && !progress && <div style={{ color: "#8b949e", textAlign: "center", padding: 40 }}>Processing document...</div>}
         {error && <div style={{ color: "#ef4444", padding: 16 }}>Error: {error}</div>}
+        {result?.cross_validation_summary && (
+          <CrossValidationSummaryPanel summary={result.cross_validation_summary} />
+        )}
+        {result?.legal_field_diffs && (
+          <LegalFieldDiffPanel diffs={result.legal_field_diffs} />
+        )}
         {result?.notes?.length > 0 && (() => {
           const errorKeywords = ["失败", "异常"];
-          const warningKeywords = ["差异", "遗漏", "过度分割", "过大", "建议复核"];
+          const warningKeywords = ["差异", "遗漏", "过度分割", "过大", "建议复核", "不一致", "关键字段"];
           const categorized = { errors: [], warnings: [], infos: [] };
           result.notes.forEach(note => {
             if (errorKeywords.some(k => note.includes(k))) {
@@ -1362,6 +1619,10 @@ function ResultPanel({
                   const hierarchyIndent = (block.hierarchy_level || 0) * 12;
                   const hasChildren = block.relations?.some(r => r.startsWith("child:"));
                   const hasParent = !!block.parent_id;
+                  const legalDiffHit = blockTouchesLegalDiff(block, result.legal_field_diffs);
+                  const cvStatus = block.cross_validation?.status;
+                  const cvMeta = cvStatus ? cvStatusMeta(cvStatus) : null;
+                  const cvMismatch = cvStatus === "mismatch";
                   return (
                     <div
                       key={i}
@@ -1386,7 +1647,10 @@ function ResultPanel({
                       style={{
                         background: isHighlighted ? "rgba(34, 197, 94, 0.2)" : (block.structure_type === "table" ? "rgba(245, 158, 11, 0.1)" : "#262c36"),
                         border: isHighlighted ? "1px solid rgba(34, 197, 94, 0.7)" : (block.structure_type === "table" ? "1px solid rgba(245, 158, 11, 0.3)" : "1px solid #30363d"),
-                        borderLeft: hasParent ? `3px solid ${blockColor}` : undefined,
+                        borderLeft: (legalDiffHit || cvMismatch)
+                          ? "3px solid #f87171"
+                          : (cvStatus === "match" ? "3px solid #34d399"
+                          : (hasParent ? `3px solid ${blockColor}` : undefined)),
                         borderRadius: 6, padding: 10, paddingLeft: hasParent ? 10 + hierarchyIndent : 10 + hierarchyIndent, marginBottom: 8, display: "flex", alignItems: "flex-start", gap: 10,
                         cursor: "pointer",
                         transition: "background 0.1s, border-color 0.1s"
@@ -1415,6 +1679,28 @@ function ResultPanel({
                           {block.group_id && block.group_id !== "single" && (
                             <span style={{ fontSize: 10, color: "#6b7280", fontStyle: "italic" }}>
                               {block.group_id}
+                            </span>
+                          )}
+                          {legalDiffHit && (
+                            <span style={{
+                              fontSize: 10, color: "#f87171",
+                              background: "rgba(248,113,113,0.12)",
+                              padding: "1px 6px", borderRadius: 4,
+                            }}>
+                              案号/金额 OCR≠VLM
+                            </span>
+                          )}
+                          {cvMeta && (
+                            <span style={{
+                              fontSize: 10, color: cvMeta.color,
+                              background: cvMeta.bg,
+                              padding: "1px 6px", borderRadius: 4,
+                            }}
+                              title={cvStatus === "mismatch"
+                                ? `主: ${block.cross_validation.primary_text}\n副: ${block.cross_validation.secondary_text}\n相似度: ${(block.cross_validation.similarity * 100).toFixed(0)}%`
+                                : cvMeta.label}
+                            >
+                              {cvMeta.label}
                             </span>
                           )}
                           {hasChildren && (
@@ -1486,7 +1772,7 @@ function ResultPanel({
                   color: result.vlm_used ? "#34d399" : "#a5b4fc",
                   border: `1px solid ${result.vlm_used ? "rgba(52,211,153,0.35)" : "rgba(99,102,241,0.35)"}`,
                 }}>
-                  {result.vlm_used ? `✦ VLM · ${result.vlm_engine || "enabled"}` : "⊕ PaddleOCR (geometric fallback)"}
+                  {result.vlm_used ? `✦ VLM · ${result.vlm_engine || "enabled"}` : "⊕ OCR (geometric fallback)"}
                 </span>
                 {!result.vlm_used && <span style={{ fontSize: 12, color: "#8b949e" }}>VLM 未启用或调用失败，当前为几何布局提取结果</span>}
                 {result.vlm_used && result.blocks?.length > 0 && (() => {
@@ -1505,18 +1791,41 @@ function ResultPanel({
               </div>
             )}
 
-            {/* Extracted raw text from the document */}
-            {result.text && (
-              <div>
-                <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>📄 提取文本</div>
+            {/* 精读原文：与「生成摘要」同次 VLM 产出；原始拼接见 Raw Text 标签 */}
+            <div>
+              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                {summary?.readable_transcript ? "📄 精读文本（AI 去噪）" : "📄 可读原文"}
+              </div>
+              {summary?.readable_transcript ? (
                 <pre style={{
                   background: "#1c2128", borderRadius: 8, padding: 14, fontSize: 13,
                   color: "#e6edf3", whiteSpace: "pre-wrap", wordBreak: "break-word",
-                  lineHeight: 1.7, maxHeight: 260, overflow: "auto",
-                  border: "1px solid #30363d",
-                }}>{result.text}</pre>
-              </div>
-            )}
+                  lineHeight: 1.7, maxHeight: 480, overflow: "auto",
+                  border: "1px solid rgba(52,211,153,0.25)",
+                }}>{summary.readable_transcript}</pre>
+              ) : summary && result.text ? (
+                <>
+                  <div style={{ fontSize: 12, color: "#fbbf24", marginBottom: 8, lineHeight: 1.5 }}>
+                    本次摘要未返回 readable_transcript 字段，暂显示与 Raw Text 相同的原始拼接文本。
+                  </div>
+                  <pre style={{
+                    background: "#1c2128", borderRadius: 8, padding: 14, fontSize: 13,
+                    color: "#e6edf3", whiteSpace: "pre-wrap", wordBreak: "break-word",
+                    lineHeight: 1.7, maxHeight: 260, overflow: "auto",
+                    border: "1px solid #30363d",
+                  }}>{result.text}</pre>
+                </>
+              ) : result.text ? (
+                <div style={{
+                  background: "#1c2128", borderRadius: 8, padding: 14, fontSize: 13,
+                  color: "#9ca3af", lineHeight: 1.7, border: "1px solid #30363d",
+                }}>
+                  逐字提取结果（含版面/时间戳等噪音）请在 <strong style={{ color: "#e6edf3" }}>Raw Text</strong> 标签页查看。
+                  <br /><br />
+                  点击下方 <strong style={{ color: "#a5b4fc" }}>生成摘要</strong> 后，此处将显示与结构化摘要<strong style={{ color: "#34d399" }}>同一次</strong> VLM 调用产出的<strong style={{ color: "#e6edf3" }}>去噪可读原文</strong>（readable_transcript），便于阅读与核对。
+                </div>
+              ) : null}
+            </div>
 
             {/* Block type breakdown */}
             {result.blocks?.length > 0 && (() => {
@@ -1551,7 +1860,7 @@ function ResultPanel({
                     onClick={onSummarize}
                     style={{ padding: "10px 24px", background: "#6366f1", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}
                   >
-                    ✨ 生成摘要
+                    ✨ 生成摘要与精读文本
                   </button>
                 </div>
               )}
@@ -1925,8 +2234,8 @@ function App() {
   }, []);
 
   const engineLabel = useMemo(() => {
-    if (!vlmConfig) return result ? "PaddleOCR" : "Ready";
-    if (!vlmConfig.enabled) return "PaddleOCR (geometry)";
+    if (!vlmConfig) return result ? "OCR" : "Ready";
+    if (!vlmConfig.enabled) return "OCR (geometry)";
     const provider = vlmConfig.provider || "vlm";
     const model = vlmConfig.model || "custom";
     return `VLM · ${provider} / ${model}`;

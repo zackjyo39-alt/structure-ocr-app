@@ -21,6 +21,18 @@ import urllib.error
 
 logger = logging.getLogger(__name__)
 
+
+def normalize_gemini_base_url(base_url: str) -> str:
+    """Normalize stored base_url to Generative Language API root (v1 / v1beta / custom host)."""
+    u = (base_url or "").strip().rstrip("/")
+    if not u:
+        return "https://generativelanguage.googleapis.com/v1beta"
+    # User pasted a full resource URL by mistake
+    if "/models/" in u:
+        u = u.split("/models/", 1)[0].rstrip("/")
+    return u or "https://generativelanguage.googleapis.com/v1beta"
+
+
 # ---------------------------------------------------------------------------
 # Runtime configuration (thread-safe singleton)
 # ---------------------------------------------------------------------------
@@ -54,6 +66,20 @@ def _save_config_to_disk(cfg: dict):
 
 _config: dict = _load_config_from_disk()
 
+# Ollama model name substrings (lowercase) that benefit from the document-OCR prompt variant
+# (end-to-end OCR / layout models — complementary to geometric OCR, not a second bbox IoU pass).
+_OLLAMA_DOCUMENT_OCR_MARKERS: tuple[str, ...] = (
+    "deepseek-ocr",
+    "glm-ocr",
+    "glm_ocr",
+)
+
+
+def _ollama_model_uses_document_ocr_prompt(model: str | None) -> bool:
+    m = (model or "").lower()
+    return any(marker in m for marker in _OLLAMA_DOCUMENT_OCR_MARKERS)
+
+
 PROVIDER_PRESETS: dict[str, dict] = {
     # ── Ollama (local) ─────────────────────────────────────────────────────
     "ollama-llava": {
@@ -71,6 +97,22 @@ PROVIDER_PRESETS: dict[str, dict] = {
         "api_key": "",
         "label": "Ollama · Llama 3.2 Vision (Local)",
         "description": "Meta 官方视觉模型，OCR 质量优于 LLaVA。需先运行 ollama pull llama3.2-vision",
+    },
+    "ollama-deepseek-ocr": {
+        "provider": "ollama",
+        "model": "deepseek-ocr:3b",
+        "base_url": "http://localhost:11434/api/chat",
+        "api_key": "",
+        "label": "Ollama · DeepSeek-OCR",
+        "description": "端到端文档 OCR/版式理解（VLM 路径）。需 vision 模型：ollama pull deepseek-ocr:3b（名称以本地库为准）",
+    },
+    "ollama-glm-ocr": {
+        "provider": "ollama",
+        "model": "glm-ocr",
+        "base_url": "http://localhost:11434/api/chat",
+        "api_key": "",
+        "label": "Ollama · GLM-OCR",
+        "description": "端到端文档 OCR（VLM 路径）。若 Ollama 暂无官方包名，请改为社区 tag 或云端 API；占位名 glm-ocr",
     },
     # ── NVIDIA NIM (cloud, OpenAI-compatible) ──────────────────────────────
     # Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
@@ -119,11 +161,11 @@ PROVIDER_PRESETS: dict[str, dict] = {
     },
     "gemini-3-flash": {
         "provider": "gemini",
-        "model": "gemini-3-flash",
+        "model": "gemini-3-flash-preview",
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "api_key": "",
-        "label": "Google · Gemini 3 Flash",
-        "description": "Google 最新一代模型（2026），能力全面超越 2.5 系列",
+        "label": "Google · Gemini 3 Flash (Preview)",
+        "description": "官方 model code 为 gemini-3-flash-preview；若 404 可尝试将 Base URL 改为 …/v1 或核对 AI Studio 模型列表",
     },
 }
 
@@ -146,7 +188,7 @@ def set_vlm_config(updates: dict) -> dict:
 # Extraction prompt
 # ---------------------------------------------------------------------------
 
-def get_vlm_prompt(ocr_hints: str | None = None) -> str:
+def get_vlm_prompt(ocr_hints: str | None = None, *, document_ocr_model: bool = False) -> str:
     base = """You are an ultra-precise Legal Document Structure Extraction AI.
 Your ONLY objective is to reconstruct the spatial and semantic layout of the provided image into JSON.
 
@@ -178,6 +220,13 @@ Output ONLY this JSON (no markdown wrappers, no extra commentary):
   ]
 }
 """
+    if document_ocr_model:
+        base += (
+            "\n\nDocument-OCR mode: pay extra attention to complex layouts—multi-column text, "
+            "merged cells, footnotes, stamps, and formulas. Preserve cell boundaries by using "
+            "separate blocks or clear `text` with embedded line breaks; still map legal headings "
+            "to `group_id` when applicable. Output must remain the single JSON object above.\n"
+        )
     if ocr_hints:
         base += f"\n\n[OCR HINTS]\nThe following text has been extracted by a geometric OCR engine. Use this strictly as a reference to avoid hallucinating complex legal characters, but fix layout ordering based on the image.\n\n<OCR_TEXT>\n{ocr_hints}\n</OCR_TEXT>\n"
     
@@ -214,7 +263,8 @@ def _parse_vlm_json_response(text: str) -> list[dict] | None:
 
 def _call_ollama(base64_image: str, cfg: dict, ocr_hints: str | None = None) -> list[dict] | None:
     url = cfg["base_url"] or "http://localhost:11434/api/chat"
-    prompt = get_vlm_prompt(ocr_hints)
+    doc_ocr = _ollama_model_uses_document_ocr_prompt(cfg.get("model"))
+    prompt = get_vlm_prompt(ocr_hints, document_ocr_model=doc_ocr)
     payload = {
         "model": cfg["model"],
         "format": "json",
@@ -269,7 +319,7 @@ def _call_openai(base64_image: str, cfg: dict, ocr_hints: str | None = None) -> 
 def _call_gemini(base64_image: str, cfg: dict, ocr_hints: str | None = None) -> list[dict] | None:
     model = cfg["model"] or "gemini-2.5-flash"
     api_key = cfg["api_key"]
-    base_url = cfg.get("base_url", "").rstrip("/") or "https://generativelanguage.googleapis.com/v1beta"
+    base_url = normalize_gemini_base_url(cfg.get("base_url", ""))
     prompt = get_vlm_prompt(ocr_hints)
     url = f"{base_url}/models/{model}:generateContent?key={api_key}"
     payload = {
@@ -322,16 +372,32 @@ def extract_via_vlm(base64_image: str, ocr_hints: str | None = None) -> list[dic
 # Summary prompt & public API
 # ---------------------------------------------------------------------------
 
-VLM_SUMMARY_PROMPT = """You are an expert Legal Case Document Analyst. 
-Analyze the provided image and extract key juridical points with zero hallucination.
+VLM_SUMMARY_PROMPT = """You are an expert document analyst. The image may be a legal judgment, a contract, a chat screenshot (e.g. WeChat), or other scans.
+
+MANDATORY LANGUAGE (产品面向中文用户):
+- 除非法条、案号、护照号、URL、代码等必须保持原文的片段外，JSON 内所有说明性字符串必须使用「简体中文」书写。
+- main_ruling：必须用中文写 2～4 句（核心事实、争议或结论；非法务类则概括图片内容），禁止用英文写该字段。
+- plaintiff_defendant：数组内每项用中文表述（人名可与图中一致）。
+- readable_transcript：若界面/正文以中文为主，则用中文整理全文；人名、金额、日期、原文引语保持与图中一致，勿翻译成英文。
+
+Goals (zero hallucination on facts; omit only clear UI/OCR junk):
+1) Structured fields when applicable (courts, case numbers, parties, ruling summary).
+2) readable_transcript: denoised full-body text in natural reading order.
+
+readable_transcript rules:
+- Preserve names, amounts, dates, places, and quoted speech exactly as shown; do not invent lines.
+- Remove or merge: repeated timestamp-only lines, duplicate system boilerplate, stray OCR fragments (tiny isolated number+quote junk with no semantic role), duplicate avatar labels—unless they carry unique content.
+- For chat logs: group by speaker or topic with blank lines between blocks; keep chronological sense.
+- Use paragraphs (blank line between topics). If almost no text, use a short honest sentence or empty string.
 
 Return ONLY this JSON object (no markdown fences, no extra text):
 {
-  "court": "Full name of the court (e.g. 北京市朝阳区人民法院), null if unknown or not applicable",
-  "case_number": "Exact case number (e.g. (2023)京0105民初1234号), copy exactly, null if unknown",
-  "plaintiff_defendant": ["List of identified plaintiffs and defendants"],
-  "main_ruling": "A concise 2-4 sentence summary of the main facts, causes of action, or final ruling",
-  "word_count_estimate": 0
+  "court": "法院全称，无法识别则 null",
+  "case_number": "案号原文，无则 null",
+  "plaintiff_defendant": ["当事人等，中文"],
+  "main_ruling": "2～4 句中文：要点摘要",
+  "word_count_estimate": 0,
+  "readable_transcript": "去噪后的可读全文，以中文为主时全文中文整理"
 }"""
 
 
@@ -387,7 +453,7 @@ def _summarize_raw_call(base64_image: str, cfg: dict) -> str | None:
     elif provider == "gemini":
         model = cfg["model"] or "gemini-2.5-flash"
         api_key = cfg["api_key"]
-        base_url = cfg.get("base_url", "").rstrip("/") or "https://generativelanguage.googleapis.com/v1beta"
+        base_url = normalize_gemini_base_url(cfg.get("base_url", ""))
         url = f"{base_url}/models/{model}:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [
