@@ -21,67 +21,6 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# File validation exceptions and functions
-# ---------------------------------------------------------------------------
-
-class FileValidationError(Exception):
-    """Raised when file validation fails."""
-    pass
-
-
-# Magic bytes for common file types
-_FILE_MAGIC_BYTES: dict[str, tuple[bytes, str]] = {
-    "application/pdf": (b"%PDF", "PDF document"),
-    "image/png": (b"\x89PNG\r\n\x1a\n", "PNG image"),
-    "image/jpeg": (b"\xFF\xD8\xFF", "JPEG image"),
-    "image/webp": (b"RIFF", "WebP image"),
-}
-
-
-def validate_file_magic_bytes(data: bytes, expected_mime: str) -> bool:
-    """Check file magic bytes against expected MIME type."""
-    if expected_mime not in _FILE_MAGIC_BYTES:
-        raise FileValidationError(f"Unsupported MIME type: {expected_mime}")
-    
-    magic, description = _FILE_MAGIC_BYTES[expected_mime]
-    
-    if expected_mime == "image/webp":
-        if len(data) >= 12 and data[:4] == magic and data[8:12] == b"WEBP":
-            return True
-        raise FileValidationError(f"Not a valid WebP file")
-    
-    if not data.startswith(magic):
-        raise FileValidationError(f"Not a valid {description}")
-    
-    return True
-
-
-def validate_file_content(file_data: bytes, filename: str) -> dict:
-    """Validate file based on extension and magic bytes."""
-    suffix = filename.lower().split(".")[-1] if "." in filename else ""
-    
-    mime_map = {
-        "pdf": "application/pdf",
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "webp": "image/webp",
-    }
-    
-    if suffix not in mime_map:
-        return {"valid": False, "mime_type": "", "error": f"Unsupported file type: {suffix}"}
-    
-    expected_mime = mime_map[suffix]
-    
-    try:
-        validate_file_magic_bytes(file_data, expected_mime)
-        return {"valid": True, "mime_type": expected_mime, "error": ""}
-    except FileValidationError as e:
-        return {"valid": False, "mime_type": expected_mime, "error": str(e)}
-
-
 # ---------------------------------------------------------------------------
 # Legal field regex patterns
 # ---------------------------------------------------------------------------
@@ -125,6 +64,10 @@ _VALID_PROVINCE_CODES = {
     "蒙", "陕", "吉", "闽", "贵", "粤", "青", "藏", "川", "宁",
     "琼", "港", "澳", "台",
 }
+
+_PARTY_ROLE_RE = re.compile(
+    r"(原告|被告|上诉人|被上诉人|申请人|被申请人|第三人)[：:\s]*([^\n，。,；;（）()]{1,40})"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +284,169 @@ def merge_legal_field_page_diffs(pages: list[dict]) -> dict | None:
     }
 
 
+def extract_evidence_items(
+    blocks: list[dict],
+    legal_field_diffs: dict | None = None,
+) -> list[dict]:
+    """Derive lightweight evidence units from extracted blocks.
+
+    This is intentionally heuristic and additive: it does not mutate OCR/VLM
+    output, only surfaces high-signal legal facts as reviewable evidence items.
+    """
+    items: list[dict] = []
+    seen: set[tuple] = set()
+    mismatch_case_keys: dict[int, set[str]] = defaultdict(set)
+    mismatch_amount_keys: dict[int, set[str]] = defaultdict(set)
+
+    for page in (legal_field_diffs or {}).get("pages", []):
+        page_no = int(page.get("page") or 1)
+        for row in page.get("case_numbers", []):
+            if row.get("status") != "match" and row.get("normalized"):
+                mismatch_case_keys[page_no].add(row["normalized"])
+        for row in page.get("amounts", []):
+            if row.get("status") != "match" and row.get("value_yuan") is not None:
+                mismatch_amount_keys[page_no].add(_amount_match_key(float(row["value_yuan"])))
+
+    for idx, block in enumerate(blocks):
+        text = (block.get("text") or "").strip()
+        if not text:
+            continue
+
+        page = int(block.get("page") or 1)
+        confidence = block.get("confidence")
+        bbox = block.get("bbox")
+        block_type = block.get("structure_type") or block.get("type") or "text"
+        base_missing_fields: list[str] = []
+        if confidence is None:
+            base_missing_fields.append("confidence")
+        if not bbox:
+            base_missing_fields.append("bbox")
+
+        for raw in _extract_case_number_spans(text):
+            normalized = _normalize_case_number(raw)
+            key = ("case_number", page, normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            review_reasons = []
+            if normalized in mismatch_case_keys.get(page, set()):
+                review_reasons.append("ocr_vlm_case_number_mismatch")
+            items.append({
+                "id": f"case_number:{page}:{len(items)}",
+                "page": page,
+                "evidence_type": "case_number",
+                "label": "案号",
+                "summary": raw,
+                "source_text": text,
+                "normalized_value": normalized,
+                "source_block_index": idx,
+                "confidence": confidence,
+                "missing_fields": list(base_missing_fields),
+                "needs_review": bool(review_reasons or base_missing_fields),
+                "review_reasons": review_reasons,
+                "parties": [],
+                "dates": [],
+            })
+
+        for raw, amount in _extract_amount_spans(text):
+            amount_key = _amount_match_key(amount)
+            key = ("amount", page, amount_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            review_reasons = []
+            if amount_key in mismatch_amount_keys.get(page, set()):
+                review_reasons.append("ocr_vlm_amount_mismatch")
+            items.append({
+                "id": f"amount:{page}:{len(items)}",
+                "page": page,
+                "evidence_type": "amount",
+                "label": "金额",
+                "summary": f"{raw} ({amount:,.2f} 元)",
+                "source_text": text,
+                "normalized_value": amount_key,
+                "amount_yuan": round(amount, 2),
+                "source_block_index": idx,
+                "confidence": confidence,
+                "missing_fields": list(base_missing_fields),
+                "needs_review": bool(review_reasons or base_missing_fields),
+                "review_reasons": review_reasons,
+                "parties": [],
+                "dates": [],
+            })
+
+        dates = _extract_date_values(text)
+        for date_value in dates:
+            key = ("date", page, date_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "id": f"date:{page}:{len(items)}",
+                "page": page,
+                "evidence_type": "date",
+                "label": "日期",
+                "summary": date_value,
+                "source_text": text,
+                "normalized_value": date_value,
+                "source_block_index": idx,
+                "confidence": confidence,
+                "missing_fields": list(base_missing_fields),
+                "needs_review": bool(base_missing_fields),
+                "review_reasons": [],
+                "parties": [],
+                "dates": [date_value],
+            })
+
+        parties = _extract_party_mentions(text)
+        if parties:
+            normalized_party_key = "|".join(f"{p['role']}:{p['name']}" for p in parties)
+            key = ("party", page, normalized_party_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "id": f"party:{page}:{len(items)}",
+                "page": page,
+                "evidence_type": "party",
+                "label": "当事人",
+                "summary": "；".join(f"{p['role']}：{p['name']}" for p in parties),
+                "source_text": text,
+                "normalized_value": normalized_party_key,
+                "source_block_index": idx,
+                "confidence": confidence,
+                "missing_fields": list(base_missing_fields),
+                "needs_review": bool(base_missing_fields),
+                "review_reasons": [],
+                "parties": [f"{p['role']}:{p['name']}" for p in parties],
+                "dates": dates,
+            })
+
+        if block_type in _LEGAL_GROUP_IDS and len(text) >= 20:
+            key = ("fact", page, text[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "id": f"fact:{page}:{len(items)}",
+                "page": page,
+                "evidence_type": "fact",
+                "label": "事实片段",
+                "summary": text[:80] + ("..." if len(text) > 80 else ""),
+                "source_text": text,
+                "normalized_value": None,
+                "source_block_index": idx,
+                "confidence": confidence,
+                "missing_fields": list(base_missing_fields),
+                "needs_review": bool(base_missing_fields),
+                "review_reasons": [],
+                "parties": [f"{p['role']}:{p['name']}" for p in parties],
+                "dates": dates,
+            })
+
+    return items
+
+
 def compute_consensus_score(
     vlm_blocks: list[dict],
     ocr_blocks: list[dict],
@@ -458,90 +564,27 @@ def _jaccard_bigram_similarity(s1: str, s2: str) -> float:
 
     intersection = b1 & b2
     union = b1 | b2
-    return len(intersection) / len(union) if union else 0.0
-
-
-def detect_conflicts(blocks: list[dict]) -> list[dict]:
-    """Detect conflicts within extracted blocks."""
-    conflicts = []
-    
-    case_numbers = []
-    amounts = []
-    
-    for idx, block in enumerate(blocks):
-        text = block.get("text", "")
-        
-        for m in _CASE_NUMBER_RE.finditer(text):
-            case_num = _normalize_case_number(m.group(0))
-            case_numbers.append({
-                "index": idx,
-                "value": m.group(0),
-                "normalized": case_num,
-            })
-        
-        for m in _AMOUNT_YUAN_RE.finditer(text):
-            try:
-                val = float(m.group(1).replace(",", ""))
-                amounts.append({
-                    "index": idx,
-                    "value": m.group(0),
-                    "numeric": val,
-                })
-            except ValueError:
-                pass
-    
-    seen_cases = {}
-    for cn in case_numbers:
-        norm = cn["normalized"]
-        if norm in seen_cases:
-            conflicts.append({
-                "type": "duplicate_case_number",
-                "locations": [seen_cases[norm]["index"], cn["index"]],
-                "values": [seen_cases[norm]["value"], cn["value"]],
-                "severity": "high",
-            })
-        else:
-            seen_cases[norm] = cn
-    
-    seen_amounts = {}
-    for amt in amounts:
-        key = f"{amt['numeric']:.2f}"
-        if key in seen_amounts:
-            if seen_amounts[key]["value"] != amt["value"]:
-                conflicts.append({
-                    "type": "conflicting_amount",
-                    "locations": [seen_amounts[key]["index"], amt["index"]],
-                    "values": [seen_amounts[key]["value"], amt["value"]],
-                    "severity": "medium",
-                })
-        else:
-            seen_amounts[key] = amt
-    
-    return conflicts
-
-
-def compute_document_consistency_score(blocks: list[dict]) -> dict:
-    """Aggregate per-block consistency to document level."""
-    total = len(blocks)
-    if total == 0:
-        return {"overall_score": 1.0, "block_count": 0, "low_confidence_count": 0, "conflicts_found": 0}
-    
-    low_conf = sum(1 for b in blocks if (b.get("confidence", 0.85) or 0.85) < 0.6)
-    conflicts = detect_conflicts(blocks)
-    
-    confidence_sum = sum(b.get("confidence", 0.85) or 0.85 for b in blocks)
-    avg_conf = confidence_sum / total
-    
-    conflict_penalty = len([c for c in conflicts if c["severity"] == "high"]) * 0.1
-    conflict_penalty += len([c for c in conflicts if c["severity"] == "medium"]) * 0.05
-    
-    overall = max(0.0, min(1.0, avg_conf - conflict_penalty))
-    
-    return {
-        "overall_score": round(overall, 4),
-        "block_count": total,
-        "low_confidence_count": low_conf,
-        "conflicts_found": len(conflicts),
-    }
 
     return len(intersection) / len(union)
+
+
+def _extract_date_values(text: str) -> list[str]:
+    values: list[str] = []
+    for m in _DATE_YEAR_MONTH_DAY_RE.finditer(text or ""):
+        values.append(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}")
+    for m in _DATE_ISO_RE.finditer(text or ""):
+        values.append(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}")
+    return list(dict.fromkeys(values))
+
+
+def _extract_party_mentions(text: str) -> list[dict]:
+    parties: list[dict] = []
+    for m in _PARTY_ROLE_RE.finditer(text or ""):
+        name = m.group(2).strip()
+        if not name:
+            continue
+        parties.append({
+            "role": m.group(1),
+            "name": name,
+        })
+    return parties

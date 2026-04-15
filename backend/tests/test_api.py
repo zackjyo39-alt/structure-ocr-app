@@ -2,29 +2,17 @@ from __future__ import annotations
 
 from io import BytesIO
 
+import numpy as np
+from PIL import Image
 from fastapi.testclient import TestClient
 
-from app.ocr import _normalize_pdf_line_breaks
+import app.main as main_module
 from app.main import app
+from app.ocr import _OcrEngineWrapper, _normalize_pdf_line_breaks, _rapidocr_raw_list
 from app.validation import compute_legal_field_diffs_for_page
-from app.vlm import PROVIDER_PRESETS, normalize_gemini_base_url
+from app.vlm import normalize_gemini_base_url
 
 client = TestClient(app)
-
-
-def test_vlm_presets_include_ollama_document_ocr() -> None:
-    assert "ollama-deepseek-ocr" in PROVIDER_PRESETS
-    assert "ollama-glm-ocr" in PROVIDER_PRESETS
-    assert PROVIDER_PRESETS["ollama-deepseek-ocr"]["provider"] == "ollama"
-    assert PROVIDER_PRESETS["ollama-deepseek-ocr"]["model"] == "deepseek-ocr:3b"
-    assert PROVIDER_PRESETS["ollama-glm-ocr"]["provider"] == "ollama"
-
-
-def test_vlm_prompt_document_ocr_variant() -> None:
-    from app.vlm import get_vlm_prompt
-
-    assert "Document-OCR mode" in get_vlm_prompt(document_ocr_model=True)
-    assert "Document-OCR mode" not in get_vlm_prompt(document_ocr_model=False)
 
 
 def test_health() -> None:
@@ -66,6 +54,66 @@ def test_extract_txt_file_returns_text() -> None:
     assert len(body["blocks"]) == 1
     assert body["blocks"][0]["type"] == "text"
     assert body["checksum"]
+
+
+def test_extract_txt_file_derives_evidence_items() -> None:
+    content = (
+        "原告：张三\n"
+        "被告：李四\n"
+        "案号：（2024）京0105民初1234号\n"
+        "签约日期：2024年3月5日\n"
+        "争议金额：¥12345.50元\n"
+    ).encode("utf-8")
+    response = client.post(
+        "/api/extract",
+        files={"file": ("evidence.txt", BytesIO(content), "text/plain")},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["evidence_items"]
+    types = {item["evidence_type"] for item in body["evidence_items"]}
+    assert "party" in types
+    assert "case_number" in types
+    assert "date" in types
+    assert "amount" in types
+
+
+def test_extract_rejects_oversized_file(monkeypatch) -> None:
+    monkeypatch.setattr(main_module, "MAX_FILE_SIZE_MB", 1)
+    content = b"x" * (2 * 1024 * 1024)
+    response = client.post(
+        "/api/extract",
+        files={"file": ("too-large.txt", BytesIO(content), "text/plain")},
+    )
+    assert response.status_code == 413
+    assert "exceeds maximum 1MB" in response.json()["detail"]
+
+
+def test_rapidocr_raw_list_accepts_numpy_arrays() -> None:
+    class FakeRapidOCRResult:
+        boxes = np.array([[[0, 0], [10, 0], [10, 10], [0, 10]]], dtype=float)
+        txts = np.array(["hello"])
+        scores = np.array([0.95], dtype=float)
+
+    rows = _rapidocr_raw_list(FakeRapidOCRResult())
+    assert len(rows) == 1
+    assert rows[0][1][0] == "hello"
+    assert rows[0][1][1] == 0.95
+
+
+def test_apple_vision_wrapper_uses_callable_ocrmac_api() -> None:
+    called = {"detail": None}
+
+    def fake_text_from_image(image, detail=True):
+        called["detail"] = detail
+        return [("hello", 0.88, (0.1, 0.2, 0.3, 0.1))]
+
+    wrapper = _OcrEngineWrapper("apple_vision", fake_text_from_image)
+    image = Image.new("RGB", (100, 80), color="white")
+    blocks, text = wrapper.predict(np.zeros((80, 100, 3), dtype=np.uint8), image)
+    assert called["detail"] is True
+    assert text == "hello"
+    assert len(blocks) == 1
 
 
 def test_extract_invalid_pdf_file_returns_graceful_error() -> None:

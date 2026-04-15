@@ -166,6 +166,128 @@ function statusLabelLegalDiff(status) {
   return m[status] || status;
 }
 
+function EvidencePanel({ items }) {
+  if (!items?.length) {
+    return (
+      <div style={{ color: "#8b949e", textAlign: "center", padding: 40 }}>
+        还没有提取到高信号证据单元
+      </div>
+    );
+  }
+
+  const counts = {};
+  items.forEach((item) => {
+    counts[item.evidence_type] = (counts[item.evidence_type] || 0) + 1;
+  });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {Object.entries(counts).map(([type, count]) => (
+          <span
+            key={type}
+            style={{
+              background: "#262c36",
+              color: "#c9d1d9",
+              borderRadius: 999,
+              padding: "4px 10px",
+              fontSize: 12,
+            }}
+          >
+            {type}: {count}
+          </span>
+        ))}
+      </div>
+
+      {items.map((item) => (
+        <div
+          key={item.id}
+          style={{
+            background: "#1c2128",
+            border: item.needs_review ? "1px solid rgba(248,113,113,0.35)" : "1px solid #30363d",
+            borderRadius: 8,
+            padding: 12,
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: "#e6edf3", fontWeight: 600 }}>{item.label}</span>
+            <span style={{ fontSize: 11, color: "#8b949e" }}>Page {item.page}</span>
+            {item.amount_yuan != null && (
+              <span style={{ fontSize: 11, color: "#34d399" }}>{item.amount_yuan.toFixed(2)} 元</span>
+            )}
+            {item.confidence != null && (
+              <span style={{ fontSize: 11, color: "#8b949e" }}>
+                Conf {(item.confidence * 100).toFixed(1)}%
+              </span>
+            )}
+            {item.needs_review && (
+              <span
+                style={{
+                  fontSize: 10,
+                  color: "#f87171",
+                  background: "rgba(248,113,113,0.12)",
+                  borderRadius: 999,
+                  padding: "2px 8px",
+                }}
+              >
+                待复核
+              </span>
+            )}
+          </div>
+
+          <div style={{ fontSize: 14, color: "#e6edf3", lineHeight: 1.6 }}>{item.summary}</div>
+
+          {(item.parties?.length > 0 || item.dates?.length > 0) && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {item.parties?.map((party) => (
+                <span key={party} style={{ fontSize: 11, color: "#a5b4fc" }}>
+                  {party}
+                </span>
+              ))}
+              {item.dates?.map((date) => (
+                <span key={date} style={{ fontSize: 11, color: "#fbbf24" }}>
+                  {date}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div
+            style={{
+              fontSize: 12,
+              color: "#8b949e",
+              whiteSpace: "pre-wrap",
+              background: "#11161c",
+              borderRadius: 6,
+              padding: 10,
+            }}
+          >
+            {item.source_text}
+          </div>
+
+          {(item.review_reasons?.length > 0 || item.missing_fields?.length > 0) && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {item.review_reasons?.map((reason) => (
+                <span key={reason} style={{ fontSize: 10, color: "#fca5a5" }}>
+                  {reason}
+                </span>
+              ))}
+              {item.missing_fields?.map((field) => (
+                <span key={field} style={{ fontSize: 10, color: "#fbbf24" }}>
+                  缺少 {field}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function LegalFieldDiffPanel({ diffs }) {
   if (!diffs?.pages?.length) return null;
 
@@ -733,6 +855,16 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
 
   const handlePresetChange = (presetId) => {
     if (!presetId) return;
+    if (presetId === "__local_deepseek__") {
+      setForm((current) => ({
+        ...current,
+        provider: "ollama",
+        model: "deepseek-ocr:3b",
+        base_url: "http://localhost:11434/api/chat",
+      }));
+      setStatus("已载入预设：Ollama · deepseek-ocr:3b");
+      return;
+    }
     const preset = presets[presetId];
     if (!preset) return;
     setForm((current) => ({
@@ -862,12 +994,36 @@ function ConfigPanel({ vlmConfig, setVlmConfig }) {
               if (id === "nim-paddleocr-vl") label += " · 推荐：轻量化实时应用";
               if (id === "nim-deepseek-ocr") label += " · 推荐：高质量知识库 RAG 压缩";
               if (id === "ollama-deepseek-ocr") label += " · 推荐：完全本地隐私方案";
-              if (id === "ollama-glm-ocr") label += " · VLM 文档 OCR（模型名以 Ollama 为准）";
               return (
                 <option key={id} value={id}>{label}</option>
               );
             })}
+            {!presets["ollama-deepseek-ocr"] && (
+              <option value="__local_deepseek__">Ollama · deepseek-ocr:3b · 推荐：完全本地隐私方案</option>
+            )}
           </select>
+          {!presets["ollama-deepseek-ocr"] && (
+            <button
+              onClick={() => setForm((current) => ({
+                ...current,
+                provider: "ollama",
+                model: "deepseek-ocr:3b",
+                base_url: "http://localhost:11434/api/chat",
+              }))}
+              style={{
+                marginTop: 12,
+                background: "transparent",
+                color: "#7dd3fc",
+                border: "1px solid #164e63",
+                borderRadius: 8,
+                padding: "8px 12px",
+                cursor: "pointer",
+                fontSize: 13,
+              }}
+            >
+              一键填入 Ollama · deepseek-ocr:3b
+            </button>
+          )}
         </div>
 
         <div style={cardStyle}>
@@ -1479,6 +1635,7 @@ function ResultPanel({
 }) {
   const tabs = [
     { id: "layout", label: "Layout" },
+    { id: "evidence", label: "Evidence" },
     { id: "structure", label: "Structure" },
     { id: "raw", label: "Raw Text" },
     { id: "table", label: "Table" },
@@ -1916,6 +2073,9 @@ function ResultPanel({
             </div>
           </div>
         )}
+        {result && activeTab === "evidence" && (
+          <EvidencePanel items={result.evidence_items} />
+        )}
         {result && activeTab === "table" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             {(() => {
@@ -1966,7 +2126,7 @@ function ResultPanel({
         <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ padding: 12, background: "#161b22", borderRadius: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ fontSize: 12, color: "#8b949e" }}>
-              {result.pages} page(s) • {result.blocks.length} blocks • {result.checksum?.slice(0, 12)}...
+              {result.pages} page(s) • {result.blocks.length} blocks • {(result.evidence_items?.length || 0)} evidence items • {result.checksum?.slice(0, 12)}...
             </div>
             <button onClick={onExport} style={{
               padding: "8px 16px", background: "#6366f1", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 13

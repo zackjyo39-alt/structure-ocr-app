@@ -66,20 +66,6 @@ def _save_config_to_disk(cfg: dict):
 
 _config: dict = _load_config_from_disk()
 
-# Ollama model name substrings (lowercase) that benefit from the document-OCR prompt variant
-# (end-to-end OCR / layout models — complementary to geometric OCR, not a second bbox IoU pass).
-_OLLAMA_DOCUMENT_OCR_MARKERS: tuple[str, ...] = (
-    "deepseek-ocr",
-    "glm-ocr",
-    "glm_ocr",
-)
-
-
-def _ollama_model_uses_document_ocr_prompt(model: str | None) -> bool:
-    m = (model or "").lower()
-    return any(marker in m for marker in _OLLAMA_DOCUMENT_OCR_MARKERS)
-
-
 PROVIDER_PRESETS: dict[str, dict] = {
     # ── Ollama (local) ─────────────────────────────────────────────────────
     "ollama-llava": {
@@ -97,22 +83,6 @@ PROVIDER_PRESETS: dict[str, dict] = {
         "api_key": "",
         "label": "Ollama · Llama 3.2 Vision (Local)",
         "description": "Meta 官方视觉模型，OCR 质量优于 LLaVA。需先运行 ollama pull llama3.2-vision",
-    },
-    "ollama-deepseek-ocr": {
-        "provider": "ollama",
-        "model": "deepseek-ocr:3b",
-        "base_url": "http://localhost:11434/api/chat",
-        "api_key": "",
-        "label": "Ollama · DeepSeek-OCR",
-        "description": "端到端文档 OCR/版式理解（VLM 路径）。需 vision 模型：ollama pull deepseek-ocr:3b（名称以本地库为准）",
-    },
-    "ollama-glm-ocr": {
-        "provider": "ollama",
-        "model": "glm-ocr",
-        "base_url": "http://localhost:11434/api/chat",
-        "api_key": "",
-        "label": "Ollama · GLM-OCR",
-        "description": "端到端文档 OCR（VLM 路径）。若 Ollama 暂无官方包名，请改为社区 tag 或云端 API；占位名 glm-ocr",
     },
     # ── NVIDIA NIM (cloud, OpenAI-compatible) ──────────────────────────────
     # Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
@@ -188,7 +158,7 @@ def set_vlm_config(updates: dict) -> dict:
 # Extraction prompt
 # ---------------------------------------------------------------------------
 
-def get_vlm_prompt(ocr_hints: str | None = None, *, document_ocr_model: bool = False) -> str:
+def get_vlm_prompt(ocr_hints: str | None = None) -> str:
     base = """You are an ultra-precise Legal Document Structure Extraction AI.
 Your ONLY objective is to reconstruct the spatial and semantic layout of the provided image into JSON.
 
@@ -220,13 +190,6 @@ Output ONLY this JSON (no markdown wrappers, no extra commentary):
   ]
 }
 """
-    if document_ocr_model:
-        base += (
-            "\n\nDocument-OCR mode: pay extra attention to complex layouts—multi-column text, "
-            "merged cells, footnotes, stamps, and formulas. Preserve cell boundaries by using "
-            "separate blocks or clear `text` with embedded line breaks; still map legal headings "
-            "to `group_id` when applicable. Output must remain the single JSON object above.\n"
-        )
     if ocr_hints:
         base += f"\n\n[OCR HINTS]\nThe following text has been extracted by a geometric OCR engine. Use this strictly as a reference to avoid hallucinating complex legal characters, but fix layout ordering based on the image.\n\n<OCR_TEXT>\n{ocr_hints}\n</OCR_TEXT>\n"
     
@@ -263,8 +226,7 @@ def _parse_vlm_json_response(text: str) -> list[dict] | None:
 
 def _call_ollama(base64_image: str, cfg: dict, ocr_hints: str | None = None) -> list[dict] | None:
     url = cfg["base_url"] or "http://localhost:11434/api/chat"
-    doc_ocr = _ollama_model_uses_document_ocr_prompt(cfg.get("model"))
-    prompt = get_vlm_prompt(ocr_hints, document_ocr_model=doc_ocr)
+    prompt = get_vlm_prompt(ocr_hints)
     payload = {
         "model": cfg["model"],
         "format": "json",

@@ -6,60 +6,8 @@ import logging
 import os
 import re
 import base64
-import time
-import functools
 from dataclasses import dataclass, field
-from typing import Generator, Callable, Any
-
-
-# ---------------------------------------------------------------------------
-# Retry Configuration and Error Handling
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RetryConfig:
-    max_retries: int = 3
-    initial_backoff: float = 0.5
-    max_backoff: float = 10.0
-    backoff_multiplier: float = 2.0
-    timeout: float = 30.0
-
-
-class ResourceLimitError(Exception):
-    pass
-
-
-def with_retry(config: RetryConfig | None = None):
-    if config is None:
-        config = RetryConfig()
-    
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            last_exception = None
-            backoff = config.initial_backoff
-            
-            for attempt in range(config.max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except ResourceLimitError:
-                    raise
-                except Exception as e:
-                    last_exception = e
-                    if attempt < config.max_retries:
-                        _logger.warning(
-                            "Retry attempt %d/%d for %s after error: %s",
-                            attempt + 1, config.max_retries, func.__name__, e
-                        )
-                        time.sleep(backoff)
-                        backoff = min(backoff * config.backoff_multiplier, config.max_backoff)
-                    else:
-                        _logger.error("All retries exhausted for %s: %s", func.__name__, e)
-            
-            raise last_exception if last_exception else Exception("Unknown error")
-        
-        return wrapper
-    return decorator
+from typing import Generator
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +52,17 @@ def _legal_diff_for_vlm_page(vlm_blocks: list, ocr_text: str | None, page: int) 
 
     vlm_text = "\n".join(el.get("text", "") for el in vlm_blocks)
     return compute_legal_field_diffs_for_page(vlm_text, ocr_text, page)
+
+
+def _attach_evidence_items(result: dict) -> dict:
+    from app.validation import extract_evidence_items
+
+    if result.get("evidence_items") is None:
+        result["evidence_items"] = extract_evidence_items(
+            result.get("blocks") or [],
+            legal_field_diffs=result.get("legal_field_diffs"),
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -228,15 +187,6 @@ def _get_ocr_engine_name() -> str:
     return "paddle"
 
 
-def _rapidocr_seq(attr):
-    """Normalize RapidOCR list fields (often numpy) — never use `x or []` on ndarrays."""
-    if attr is None:
-        return []
-    if hasattr(attr, "tolist") and not isinstance(attr, (list, tuple)):
-        return attr.tolist()
-    return list(attr)
-
-
 def _rapidocr_raw_list(result) -> list:
     """Convert RapidOCR result → [[bbox_polygon, (text, score)], ...] for _reconstruct_layout."""
     if result is None:
@@ -250,6 +200,15 @@ def _rapidocr_raw_list(result) -> list:
         score = float(scores[i]) if i < len(scores) else 0.5
         rows.append([bbox, (txt, score)])
     return rows
+
+
+def _rapidocr_seq(attr):
+    """Normalize RapidOCR list fields without truth-testing ndarrays."""
+    if attr is None:
+        return []
+    if hasattr(attr, "tolist") and not isinstance(attr, (list, tuple)):
+        return attr.tolist()
+    return list(attr)
 
 
 def _apple_vision_raw_list(ocr_items, img_w: int, img_h: int) -> list:
@@ -333,8 +292,6 @@ _CV_IOU_THRESHOLD: float = float(os.environ.get("STRUCTURE_OCR_CV_IOU_THRESHOLD"
 _CV_TEXT_MATCH_THRESHOLD: float = float(
     os.environ.get("STRUCTURE_OCR_CV_TEXT_THRESHOLD", "0.80")
 )
-# On mismatch: "primary" (default) keeps primary block text; "secondary" uses secondary OCR text in the block + merged fulltext
-_CV_ON_MISMATCH: str = os.environ.get("STRUCTURE_OCR_CV_ON_MISMATCH", "primary").strip().lower()
 
 
 def _merge_cross_validate(
@@ -347,7 +304,7 @@ def _merge_cross_validate(
 ) -> tuple[list, str]:
     """Align two OCR block lists by IoU and annotate each with cross-validation status.
 
-    Returns (annotated_blocks, merged_fulltext) — fulltext 由最终块 spatial 拼接，含仅副引擎检出行。
+    Returns (annotated_blocks, primary_text).
     Each block gains a 'cross_validation' sub-dict:
         {
           "status": "match" | "mismatch" | "primary_only" | "secondary_only",
@@ -387,10 +344,6 @@ def _merge_cross_validate(
                 blk_out["score"] = min(1.0, (score_a + score_b) / 2 + 0.12)
             else:
                 blk_out["score"] = max(0.1, min(score_a, score_b) - 0.12)
-                if _CV_ON_MISMATCH == "secondary":
-                    st = (blk_b.get("text") or "").strip()
-                    if st:
-                        blk_out["text"] = blk_b.get("text", "")
             blk_out["cross_validation"] = {
                 "status": status,
                 "primary_text": blk_a.get("text"),
@@ -432,14 +385,7 @@ def _merge_cross_validate(
 
     # Re-sort by vertical position (primary_only / secondary_only may be interleaved)
     annotated.sort(key=lambda b: b.get("center_y", 0))
-    # Full OCR string from final blocks (includes secondary_only lines; matches block text after mismatch override)
-    raw_lines: list = []
-    for b in annotated:
-        bb = b.get("bbox")
-        if bb:
-            raw_lines.append([bb, (b.get("text") or "", float(b.get("score", 0.5)))])
-    _, merged_full = _reconstruct_layout(raw_lines)
-    return annotated, merged_full
+    return annotated, text_a
 
 
 def compute_cross_validation_summary(blocks: list[dict]) -> dict | None:
@@ -526,7 +472,6 @@ class _OcrEngineWrapper:
             if image_pil is None:
                 from PIL import Image
                 image_pil = Image.fromarray(image_np[:, :, ::-1])
-            # ocrmac>=1.0: use text_from_image (module no longer exposes ocrmac.OCR)
             items = self._engine(image_pil, detail=True)
             return _apple_vision_raw_list(items, image_pil.width, image_pil.height)
 
@@ -606,8 +551,8 @@ def _build_ocr_engine_wrapper() -> "_OcrEngineWrapper | _CrossValidateWrapper | 
 
     # ── cross_validate: run two engines and compare ──────────────────────────
     if name == "cross_validate":
-        primary_name = os.environ.get("STRUCTURE_OCR_CV_PRIMARY", "rapidocr").strip().lower()
-        secondary_name = os.environ.get("STRUCTURE_OCR_CV_SECONDARY", "apple_vision").strip().lower()
+        primary_name = os.environ.get("STRUCTURE_OCR_CV_PRIMARY", "apple_vision").strip().lower()
+        secondary_name = os.environ.get("STRUCTURE_OCR_CV_SECONDARY", "rapidocr").strip().lower()
         _logger.info(
             "OCR mode: cross_validate  primary=%s  secondary=%s",
             primary_name, secondary_name,
@@ -632,9 +577,9 @@ def _build_ocr_engine_wrapper() -> "_OcrEngineWrapper | _CrossValidateWrapper | 
         )
         return _build_single_engine_by_name("paddle")
 
-    # ── auto: try rapidocr → apple_vision → paddle（与 cross_validate 默认一致）────────
+    # ── auto: try apple_vision → rapidocr → paddle ───────────────────────────
     if name == "auto":
-        for candidate in ("rapidocr", "apple_vision", "paddle"):
+        for candidate in ("apple_vision", "rapidocr", "paddle"):
             engine = _build_single_engine_by_name(candidate)
             if engine:
                 _logger.info("OCR engine (auto-selected): %s", candidate)
@@ -1095,10 +1040,10 @@ class DocumentExtractor:
     def extract(self, raw: bytes, filename: str, suffix: str, mime_type: str) -> dict:
         notes: list[str] = []
         if suffix == ".txt" or mime_type == "text/plain":
-            return self._extract_text(raw, notes)
+            return _attach_evidence_items(self._extract_text(raw, notes))
         if suffix == ".pdf" or mime_type == "application/pdf":
-            return self._extract_pdf(raw, notes)
-        return self._extract_image(raw, notes)
+            return _attach_evidence_items(self._extract_pdf(raw, notes))
+        return _attach_evidence_items(self._extract_image(raw, notes))
 
     def _extract_text(self, raw: bytes, notes: list[str]) -> dict:
         try:
@@ -1562,7 +1507,7 @@ class DocumentExtractor:
                 result = self._extract_text(raw, [])
                 yield sse_format(ProgressEvent(
                     stage="complete", message="Text extraction complete", progress=1.0,
-                    extra={"result": result},
+                    extra={"result": _attach_evidence_items(result)},
                 ))
                 return
 
@@ -1703,7 +1648,7 @@ class DocumentExtractor:
                 ))
                 yield sse_format(ProgressEvent(
                     stage="complete", message="Extraction complete", progress=1.0,
-                    extra={"result": result},
+                    extra={"result": _attach_evidence_items(result)},
                 ))
                 return
 
@@ -1731,7 +1676,7 @@ class DocumentExtractor:
                     }
                     yield sse_format(ProgressEvent(
                         stage="complete", message="Structure extraction complete", progress=1.0,
-                        extra={"result": result},
+                        extra={"result": _attach_evidence_items(result)},
                     ))
                     return
             except Exception as e:
@@ -1762,7 +1707,7 @@ class DocumentExtractor:
                 }
                 yield sse_format(ProgressEvent(
                     stage="complete", message="OCR extraction complete", progress=1.0,
-                    extra={"result": result},
+                    extra={"result": _attach_evidence_items(result)},
                 ))
                 return
             except Exception as exc:
@@ -1776,7 +1721,7 @@ class DocumentExtractor:
         }
         yield sse_format(ProgressEvent(
             stage="complete", message="Extraction complete (no content extracted)", progress=1.0,
-            extra={"result": result},
+            extra={"result": _attach_evidence_items(result)},
         ))
 
     def _extract_pdf_stream(self, raw: bytes, filename: str) -> Generator[str, None, None]:
@@ -2052,5 +1997,5 @@ class DocumentExtractor:
         yield sse_format(ProgressEvent(
             stage="complete", message=f"Extraction complete: {len(doc)} pages, {len(blocks)} blocks",
             page=total_pages, total_pages=total_pages, progress=1.0,
-            extra={"result": result},
+            extra={"result": _attach_evidence_items(result)},
         ))

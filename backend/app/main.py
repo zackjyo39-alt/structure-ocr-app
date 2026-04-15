@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .ocr import DocumentExtractor, compute_cross_validation_summary, sse_format, ProgressEvent
+from .validation import extract_evidence_items
 from .vlm import get_vlm_config, normalize_gemini_base_url, set_vlm_config
 
 app = FastAPI(title="PaddleOCR Web App")
@@ -28,11 +29,8 @@ app.add_middleware(
 
 extractor = DocumentExtractor()
 SUPPORTED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt"}
-
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "100"))
-OCR_TIMEOUT_SECONDS = float(os.environ.get("OCR_TIMEOUT_SECONDS", "60.0"))
-VLM_TIMEOUT_SECONDS = float(os.environ.get("VLM_TIMEOUT_SECONDS", "120.0"))
 
 
 class PageBlock(BaseModel):
@@ -69,6 +67,7 @@ class ExtractResponse(BaseModel):
     text: str
     blocks: list[PageBlock]
     notes: list[str]
+    evidence_items: list[dict] = []
     page_infos: list[PageInfo] = []
     vlm_used: bool | None = None
     vlm_engine: str | None = None
@@ -275,6 +274,7 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     if suffix == ".pdf" and MAX_PDF_PAGES > 0:
         try:
             import fitz
+
             doc = fitz.open(stream=raw, filetype="pdf")
             page_count = len(doc)
             doc.close()
@@ -283,6 +283,8 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
                     status_code=413,
                     detail=f"PDF has {page_count} pages, exceeds maximum {MAX_PDF_PAGES} pages",
                 )
+        except HTTPException:
+            raise
         except Exception:
             pass
 
@@ -300,6 +302,10 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     # Prefer pre-computed summary (set by ocr.py when VLM path used OCR hint blocks).
     # Fall back to block-level computation for pure OCR paths.
     cv_summary = result.get("cross_validation_summary") or compute_cross_validation_summary(blocks_raw)
+    evidence_items = result.get("evidence_items") or extract_evidence_items(
+        blocks_raw,
+        legal_field_diffs=result.get("legal_field_diffs"),
+    )
     return ExtractResponse(
         filename=file.filename or "upload",
         mime_type=mime_type,
@@ -308,6 +314,7 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
         text=result["text"],
         blocks=[PageBlock(**block) for block in blocks_raw],
         notes=result["notes"],
+        evidence_items=evidence_items,
         page_infos=[PageInfo(**info) for info in result.get("page_infos", [])],
         vlm_used=result.get("vlm_used"),
         vlm_engine=result.get("vlm_engine"),

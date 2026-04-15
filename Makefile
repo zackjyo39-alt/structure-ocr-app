@@ -13,14 +13,13 @@ PYTHON := $(BACKEND)/.venv/bin/python3
 
 # ---------------------------------------------------------------------------
 # OCR engine config (override via: make start OCR_ENGINE=paddle)
-# Default: cross_validate — RapidOCR (primary) + Apple Vision (secondary).
-# Chat/UI screenshots & 中文长文: RapidOCR/Paddle 系通常更稳；Apple Vision 偶有乱码。
-# 原生清晰截图可改为: make start OCR_CV_PRIMARY=apple_vision OCR_CV_SECONDARY=rapidocr
-# Requires: pip install ".[auto]" + rapidocr stack (see Makefile install)
+# Default: cross_validate — runs Apple Vision + RapidOCR in parallel and
+# compares results block-by-block for near-100% accuracy on Mac.
+# Requires: pip install ".[auto]"
 # ---------------------------------------------------------------------------
 OCR_ENGINE          ?= cross_validate
-OCR_CV_PRIMARY      ?= rapidocr
-OCR_CV_SECONDARY    ?= apple_vision
+OCR_CV_PRIMARY      ?= apple_vision
+OCR_CV_SECONDARY    ?= rapidocr
 OCR_CV_IOU          ?= 0.35
 OCR_CV_TEXT         ?= 0.80
 
@@ -38,12 +37,11 @@ BACKEND_ENV := STRUCTURE_OCR_ENGINE=$(OCR_ENGINE) \
 help:
 	@echo "Structure-OCR - process control  (uv managed)"
 	@echo ""
-	@echo "  make install        - uv sync --extra auto (Apple Vision + RapidOCR) + npm install"
-	@echo "  make install-paddle - uv sync --extra ocr  (PaddleOCR only)"
+	@echo "  make install        - uv sync --extra apple-vision --extra dev + RapidOCR pip deps + npm install"
+	@echo "  make install-paddle - uv sync --extra ocr --extra dev + npm install"
 	@echo "  make sync           - uv sync (refresh lock, no extras)"
 	@echo "  make start          - backend :8000 + frontend :5173  [cross_validate mode by default]"
 	@echo "  make start OCR_ENGINE=paddle       - use PaddleOCR only"
-	@echo "  make start OCR_CV_PRIMARY=apple_vision OCR_CV_SECONDARY=rapidocr  - Apple 主引擎"
 	@echo "  make start OCR_ENGINE=apple_vision - use Apple Vision only"
 	@echo "  make start OCR_ENGINE=rapidocr     - use RapidOCR only"
 	@echo "  make start OCR_ENGINE=auto         - auto-select fastest available engine"
@@ -54,8 +52,8 @@ help:
 
 install:
 	@mkdir -p $(RUN)
-	@echo "-> backend core deps via uv (from lock)"
-	cd $(BACKEND) && uv sync --frozen --extra apple-vision
+	@echo "-> backend core deps via uv (from lock, with dev tools)"
+	cd $(BACKEND) && uv sync --frozen --extra apple-vision --extra dev
 	@echo "-> backend: rapidocr + onnxruntime + opencv via pip (Tsinghua mirror)"
 	cd $(BACKEND) && .venv/bin/pip install \
 	  -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
@@ -66,8 +64,8 @@ install:
 
 install-paddle:
 	@mkdir -p $(RUN)
-	@echo "-> backend deps via uv: PaddleOCR"
-	cd $(BACKEND) && UV_HTTP_TIMEOUT=120 uv sync --frozen --extra ocr
+	@echo "-> backend deps via uv: PaddleOCR + dev tools"
+	cd $(BACKEND) && UV_HTTP_TIMEOUT=120 uv sync --frozen --extra ocr --extra dev
 	@echo "-> frontend deps"
 	cd $(FRONTEND) && npm install
 
@@ -84,7 +82,7 @@ start: $(RUN)
 	fi
 	@echo "-> OCR engine: $(OCR_ENGINE)  [primary=$(OCR_CV_PRIMARY)  secondary=$(OCR_CV_SECONDARY)]"
 	@echo "-> starting backend http://127.0.0.1:8000"
-	cd $(BACKEND) && nohup env $(BACKEND_ENV) $(PYTHON) -m uvicorn app.main:app --reload --reload-dir app --host 127.0.0.1 --port 8000 >> $(LOG_BACKEND) 2>&1 & echo $$! > $(PID_BACKEND)
+	cd $(BACKEND) && nohup env $(BACKEND_ENV) $(PYTHON) -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 >> $(LOG_BACKEND) 2>&1 & echo $$! > $(PID_BACKEND)
 	@echo "-> starting frontend http://127.0.0.1:5173"
 	cd $(FRONTEND) && nohup npm run dev >> $(LOG_FRONTEND) 2>&1 & echo $$! > $(PID_FRONTEND)
 	@sleep 1
